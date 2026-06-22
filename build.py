@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 
 
 PLUGIN_KEY = "@jupyterlite/pyodide-kernel-extension:kernel"
+LAB_URL_START = "<!-- jupyterlite-lab-url:start -->"
+LAB_URL_END = "<!-- jupyterlite-lab-url:end -->"
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,14 +87,43 @@ def patch_config(config_path: Path, pyodide_url: str) -> None:
     print(f"Updated {config_path} with pyodideUrl={config['pyodideUrl']}")
 
 
+def patch_readme(readme_path: Path, lab_url: str) -> None:
+    if readme_path.exists():
+        original = readme_path.read_text(encoding="utf-8")
+    else:
+        original = ""
+
+    block = "\n".join(
+        [
+            LAB_URL_START,
+            "## JupyterLab",
+            "",
+            f"Open the notebook environment: [{lab_url}]({lab_url})",
+            LAB_URL_END,
+        ]
+    )
+
+    start = original.find(LAB_URL_START)
+    end = original.find(LAB_URL_END)
+    if start != -1 and end != -1 and start < end:
+        updated = original[:start] + block + original[end + len(LAB_URL_END) :]
+    else:
+        updated = original.rstrip() + "\n\n" + block + "\n"
+
+    readme_path.write_text(updated, encoding="utf-8")
+    print(f"Updated {readme_path} with lab URL={lab_url}")
+
+
 def main() -> int:
     args = parse_args()
     if args.local:
-        pyodide_url = "http://localhost:8000/pyodide/pyodide.js"
+        site_url = "http://localhost:8000/"
     else:
         site_url = args.site_url or infer_site_url(args.remote)
-        pyodide_url = site_url.rstrip("/") + "/pyodide/pyodide.js"
+    site_url = site_url.rstrip("/") + "/"
+    pyodide_url = site_url + "pyodide/pyodide.js"
     patch_config(Path("jupyter-lite.json"), pyodide_url)
+    patch_readme(Path("README.md"), site_url + "lab/index.html")
     return 0
 
 

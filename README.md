@@ -54,3 +54,9 @@ npm run serve
 ```
 
 Run `npm run build` again before pushing if you used `--local`.
+
+<!-- jupyterlite-lab-url:start -->
+## JupyterLab
+
+Open the notebook environment: [https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html)
+<!-- jupyterlite-lab-url:end -->
