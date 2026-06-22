@@ -33,3 +33,24 @@ Algebra and basic functions, trigonometric functions, and basic
 calculus (integrals). Familiarity with complex numbers and basic
 linear algebra will be helpful.
 
+## Deployment maintenance
+
+This repository contains a prebuilt static JupyterLite site. Before pushing a
+deployment update, run:
+
+```bash
+npm run build
+```
+
+The local `build.py` script detects the GitHub repository from the `origin`
+remote and patches `jupyter-lite.json` so the Pyodide kernel loads from the
+correct GitHub Pages URL.
+
+To preview locally:
+
+```bash
+npm run build -- --local
+npm run serve
+```
+
+Run `npm run build` again before pushing if you used `--local`.

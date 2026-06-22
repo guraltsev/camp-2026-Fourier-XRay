@@ -2,6 +2,7 @@
   "name": "math-toolkit-jupyterlite-site",
   "private": true,
   "scripts": {
+    "build": "python build.py",
     "serve": "python -m http.server 8000",
     "start": "npm run serve"
   }
