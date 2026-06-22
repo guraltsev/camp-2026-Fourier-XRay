@@ -944,6 +944,15 @@ _PLOT_WIDGET_STYLE = """
   border: 0 !important;
   box-shadow: none !important;
 }
+.mt-plot:not(.mt-plot--compact) .mt-plot__side-column {
+  min-height: 24rem !important;
+}
+.mt-plot:not(.mt-plot--compact) .mt-plot__legend,
+.mt-plot:not(.mt-plot--compact) .mt-plot__parameters-panel,
+.mt-plot:not(.mt-plot--compact) .mt-plot__info {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+}
 .mt-plot.mt-plot--compact .mt-plot__plot-column,
 .mt-plot.mt-plot--compact .mt-plot__side-column,
 .mt-plot.mt-plot--compact .mt-plot__parameters-panel,
@@ -951,8 +960,15 @@ _PLOT_WIDGET_STYLE = """
 .mt-plot.mt-plot--compact .mt-plot__controls,
 .mt-plot.mt-plot--compact .mt-plot__info,
 .mt-plot.mt-plot--compact .mt-plot__status {
+  min-height: 0 !important;
   min-width: 0 !important;
   width: 100% !important;
+}
+.mt-plot.mt-plot--compact .mt-plot__legend,
+.mt-plot.mt-plot--compact .mt-plot__parameters-panel,
+.mt-plot.mt-plot--compact .mt-plot__info {
+  flex: 0 1 auto !important;
+  max-height: 12rem !important;
 }
 .mt-plot.mt-plot--compact .mt-plot__parameter-control {
   flex-flow: row wrap !important;

@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T03:02:05.285624Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-22T02:52:23.349932Z",
+      "mimetype": "text/x-python",
+      "name": "pure_trig_fourier_matching_game.py",
+      "path": ".support/pure_trig_fourier_matching_game.py",
+      "size": 1113,
+      "type": "file",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T03:02:05.285092Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T03:02:05.285624Z",
+  "mimetype": null,
+  "name": ".support",
+  "path": ".support",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

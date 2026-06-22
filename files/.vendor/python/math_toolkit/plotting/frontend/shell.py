@@ -123,6 +123,8 @@ class FigureShellWidget(_shell_base_class()):
 .mt-plot-shell__side {
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-height: 24rem;
   min-width: 14rem;
 }
 .mt-plot-shell__side,
@@ -152,6 +154,15 @@ class FigureShellWidget(_shell_base_class()):
 .mt-plot-shell__section[data-section="info"] {
   flex-basis: var(--mt-info-section-height, 9rem);
   min-height: 5rem;
+}
+.mt-plot-shell:not([data-layout="compact"]) .mt-plot-shell__section[data-section="label"] {
+  flex: 1 1 var(--mt-label-section-height, 7rem);
+}
+.mt-plot-shell:not([data-layout="compact"]) .mt-plot-shell__section[data-section="parameter"] {
+  flex: 1 1 var(--mt-parameter-section-height, 8rem);
+}
+.mt-plot-shell:not([data-layout="compact"]) .mt-plot-shell__section[data-section="info"] {
+  flex: 1 1 var(--mt-info-section-height, 9rem);
 }
 .mt-plot-shell__section-body {
   direction: rtl;
@@ -295,8 +306,15 @@ class FigureShellWidget(_shell_base_class()):
   grid-template-columns: 1fr;
 }
 .mt-plot-shell[data-layout="compact"] .mt-plot-shell__side {
+  min-height: 0;
   min-width: 0;
   width: 100%;
+}
+.mt-plot-shell[data-layout="compact"] .mt-plot-shell__section[data-section="label"],
+.mt-plot-shell[data-layout="compact"] .mt-plot-shell__section[data-section="parameter"],
+.mt-plot-shell[data-layout="compact"] .mt-plot-shell__section[data-section="info"] {
+  flex: 0 1 auto;
+  max-height: 12rem;
 }
 .mt-plot-shell[data-layout="compact"] .mt-param-row {
   flex-wrap: wrap;
@@ -709,6 +727,8 @@ function send(model, generationId, type, payload = {}) {
   model.send({ type, generation_id: generationId, ...payload });
 }
 
+const SOUND_LONG_PRESS_MS = 650;
+
 function render({ model, el }) {
   const generationId = model.get("generation_id");
   el.classList.add("mt-plot-shell");
@@ -1088,12 +1108,46 @@ function render({ model, el }) {
       labelViewKey: "",
       labelPayloadKey: "",
       labelWidgetRef: null,
+      soundLongPressTimer: null,
+      soundLongPressHandled: false,
     };
     marker.addEventListener("click", () => {
       send(model, generationId, "toggle_plot_visibility", { node_id: row.nodeId });
     });
-    sound.addEventListener("click", () => {
+    sound.addEventListener("pointerdown", (event) => {
+      if (event.button !== undefined && event.button !== 0) {
+        return;
+      }
+      if (event.pointerId !== undefined && sound.setPointerCapture) {
+        sound.setPointerCapture(event.pointerId);
+      }
+      row.soundLongPressHandled = false;
+      window.clearTimeout(row.soundLongPressTimer);
+      row.soundLongPressTimer = window.setTimeout(() => {
+        row.soundLongPressTimer = null;
+        row.soundLongPressHandled = true;
+        send(model, generationId, "reset_plot_sound", { node_id: row.nodeId });
+      }, SOUND_LONG_PRESS_MS);
+    });
+    const clearSoundLongPress = () => {
+      window.clearTimeout(row.soundLongPressTimer);
+      row.soundLongPressTimer = null;
+    };
+    sound.addEventListener("pointerup", clearSoundLongPress);
+    sound.addEventListener("pointercancel", clearSoundLongPress);
+    sound.addEventListener("click", (event) => {
+      clearSoundLongPress();
+      if (row.soundLongPressHandled) {
+        event.preventDefault();
+        row.soundLongPressHandled = false;
+        return;
+      }
       send(model, generationId, "toggle_plot_sound", { node_id: row.nodeId });
+    });
+    sound.addEventListener("contextmenu", (event) => {
+      if (row.soundLongPressHandled) {
+        event.preventDefault();
+      }
     });
     edit.addEventListener("click", () => {
       send(model, generationId, "open_plot_settings", { node_id: row.nodeId });
@@ -1103,6 +1157,8 @@ function render({ model, el }) {
   }
 
   function disposeLegendRow(row) {
+    window.clearTimeout(row.soundLongPressTimer);
+    row.soundLongPressTimer = null;
     if (row.labelViewKey) {
       disposeView(legendLabelViews.get(row.labelViewKey));
       legendLabelViews.delete(row.labelViewKey);

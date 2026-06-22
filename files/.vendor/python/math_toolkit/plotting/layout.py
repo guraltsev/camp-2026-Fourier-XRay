@@ -160,21 +160,26 @@ class ResponsiveSidebarLayout(FigureLayout):
         self.modal_area = self.parts.modal
         self._configure_plot_fill()
         self.legend_area.layout = ipywidgets.Layout(
-            flex="0 0 auto",
+            flex="1 1 0",
             grid_gap="0.1rem",
+            min_height="0",
             min_width="18rem",
             overflow="auto",
             width="100%",
         )
+        self.controls_area.layout.flex = "1 1 auto"
+        self.controls_area.layout.min_height = "0"
         self.controls_area.layout.overflow = "auto"
         self.legend_area.observe(self._sync_legend_visibility, names="children")
         self._sync_legend_visibility()
         self.parameters_panel = ipywidgets.VBox(
             [self.controls_area],
             layout=ipywidgets.Layout(
-                flex="0 0 auto",
+                flex="1 1 0",
                 grid_gap="0.08rem",
+                min_height="0",
                 min_width="18rem",
+                overflow="hidden",
             ),
         )
         self.controls_area.observe(self._sync_parameter_visibility, names="children")
@@ -209,6 +214,7 @@ class ResponsiveSidebarLayout(FigureLayout):
             layout=ipywidgets.Layout(
                 flex="1 1 18rem",
                 grid_gap="0.1rem",
+                min_height="24rem",
                 min_width="18rem",
             ),
         )
@@ -246,6 +252,9 @@ class ResponsiveSidebarLayout(FigureLayout):
         self.output_area.layout.overflow = "auto"
         self.output_area.layout.padding = "0"
         self.info_area.layout.border = ""
+        self.info_area.layout.flex = "1 1 0"
+        self.info_area.layout.min_height = "0"
+        self.info_area.layout.overflow = "auto"
         self.info_area.layout.padding = "0"
         self.status_area.layout.border = ""
         self.status_area.layout.padding = "0"

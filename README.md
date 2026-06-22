@@ -1,26 +1,35 @@
-# math_toolkit JupyterLite
+# Seeing with Waves: Fourier Analysis and X-ray Vision 
 
-This repository serves a prebuilt JupyterLite site for `math_toolkit`.
+What does the function $sin(x^2)$ sound like? Can you hear whether a
+graph has corners, or whether it can be drawn without lifting your
+pen? Can you hear the shape of a drum? Can you determine what an
+object looks like just from its X-rays?
 
-The site is static. It already contains the JupyterLite application, notebooks,
-browser extensions, local `math_toolkit` source files, and the self-hosted
-Pyodide runtime used by the notebooks.
+In this course, we explore how complicated signals can be broken down
+into simple waves. This is Fourier analysis, where functions are sums
+of pure oscillations. We will learn how to extract these components
+and how to put them back together. We use this to efficiently encode,
+compress, and transmit signals.
 
-## Preview locally
+But what is a Fourier series? (3Blue1Brown):
+https://www.youtube.com/watch?v=r6sGWTCMz2k
 
-From this repository root:
+In many real situations, we do not get to choose what we measure. What
+if we only measure the strength of signals passing through an object
+from many different directions, like an X-ray machine does? Fourier
+analysis can be used to reconstruct what the object looks like. This
+is an example of an inverse problem: starting from measurements and we
+try to figure out what caused them. Fourier analysis can help us here
+as well. However, we will also see that not all inverse problems can
+be easily solved.
 
-```bash
-npm run serve
-```
+Expect computer-aided computation, visual exploration, and conceptual
+thinking. We will use simple computer tools for simulations and
+experiments, but no prior programming experience is required.
 
-That command only starts a static file server for the checked-in files. It does
-not build JupyterLite, Pyodide, Python packages, or notebook assets.
+**Prerequisites**
 
-## Update the site
+Algebra and basic functions, trigonometric functions, and basic
+calculus (integrals). Familiarity with complex numbers and basic
+linear algebra will be helpful.
 
-Build updates in the source template repository, then copy the generated
-`dist/` contents here and commit them.
-
-The deploy repository is intentionally serve-only so GitHub Pages can publish
-the exact static files that were built and checked locally.

@@ -5,6 +5,7 @@ from __future__ import annotations
 OPEN_PARAMETER_SETTINGS = "open_parameter_settings"
 TOGGLE_PLOT_VISIBILITY = "toggle_plot_visibility"
 TOGGLE_PLOT_SOUND = "toggle_plot_sound"
+RESET_PLOT_SOUND = "reset_plot_sound"
 OPEN_PLOT_SETTINGS = "open_plot_settings"
 MODAL_FIELD_CHANGED = "modal_field_changed"
 MODAL_APPLY = "modal_apply"

@@ -327,6 +327,8 @@ class AnywidgetFrontendBackend:
             self.legend.toggle_visibility(content.get("node_id"))
         elif message_type == messages.TOGGLE_PLOT_SOUND:
             self.legend.toggle_sound(content.get("node_id"))
+        elif message_type == messages.RESET_PLOT_SOUND:
+            self.legend.reset_sound(content.get("node_id"))
         elif message_type == messages.OPEN_PLOT_SETTINGS:
             self.modal.open_plot(node_id=content.get("node_id"))
         elif message_type == messages.MODAL_FIELD_CHANGED:

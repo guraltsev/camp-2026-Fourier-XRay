@@ -79,6 +79,19 @@ class AnywidgetLegend:
         else:
             sound.resume()
 
+    def reset_sound(self, node_id: object) -> None:
+        """Stop the target curve sound at the beginning when available."""
+
+        node = self._node_for_event(node_id)
+        if node is None:
+            return
+        handle = self.generation.figure._handle_for_node(node)
+        sound = getattr(handle, "sound", None)
+        if sound is None or not sound.enabled:
+            return
+        sound.reset()
+        sound.stop()
+
     def dispose(self) -> None:
         """Release cached legend payload state."""
 
