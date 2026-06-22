@@ -6,7 +6,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 PLUGIN_KEY = "@jupyterlite/pyodide-kernel-extension:kernel"
@@ -87,11 +87,71 @@ def patch_config(config_path: Path, pyodide_url: str) -> None:
     print(f"Updated {config_path} with pyodideUrl={config['pyodideUrl']}")
 
 
-def patch_readme(readme_path: Path, lab_url: str) -> None:
+def workspace_notebook_path(workspace: dict) -> str | None:
+    data = workspace.get("data", {})
+    if not isinstance(data, dict):
+        return None
+
+    recents = data.get("docmanager:recents", {}).get("opened", [])
+    for item in recents:
+        if item.get("contentType") == "notebook" and item.get("path"):
+            return item["path"]
+
+    for key, value in data.items():
+        if key.startswith("notebook:") and isinstance(value, dict):
+            notebook_data = value.get("data", {})
+            if isinstance(notebook_data, dict) and notebook_data.get("path"):
+                return notebook_data["path"]
+    return None
+
+
+def workspace_title(workspace_id: str, workspace: dict) -> str:
+    path = workspace_notebook_path(workspace) or workspace_id
+    stem = Path(path).stem
+    stem = re.sub(r"^\d+[-_]*", "", stem)
+    words = re.sub(r"[-_]+", " ", stem).split()
+    if not words:
+        return workspace_id
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def refresh_workspace_index(root: Path) -> dict[str, dict]:
+    workspaces_dir = root / "files" / ".workspaces"
+    workspace_index: dict[str, dict] = {}
+
+    # Publish bundled workspace files through JupyterLite's static workspace API
+    # so /lab/workspaces/<id> opens with the intended notebook already active.
+    if workspaces_dir.is_dir():
+        for path in sorted(workspaces_dir.glob("*.jupyterlab-workspace")):
+            workspace = json.loads(path.read_text(encoding="utf-8"))
+            metadata = workspace.setdefault("metadata", {})
+            workspace_id = metadata.setdefault("id", path.stem)
+            workspace_index[workspace_id] = workspace
+
+    api_dir = root / "api" / "workspaces"
+    api_dir.mkdir(parents=True, exist_ok=True)
+    (api_dir / "all.json").write_text(
+        json.dumps(workspace_index, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return workspace_index
+
+
+def patch_readme(readme_path: Path, site_url: str, workspaces: dict[str, dict]) -> None:
     if readme_path.exists():
         original = readme_path.read_text(encoding="utf-8")
     else:
         original = ""
+
+    lab_url = site_url + "lab/index.html"
+    workspace_lines = []
+    for workspace_id, workspace in sorted(workspaces.items()):
+        workspace_url = site_url + "lab/workspaces/" + quote(workspace_id, safe="")
+        workspace_lines.append(
+            f"- [{workspace_title(workspace_id, workspace)}]({workspace_url})"
+        )
+    if not workspace_lines:
+        workspace_lines = ["- No bundled workspaces were found."]
 
     block = "\n".join(
         [
@@ -99,6 +159,10 @@ def patch_readme(readme_path: Path, lab_url: str) -> None:
             "## JupyterLab",
             "",
             f"Open the notebook environment: [{lab_url}]({lab_url})",
+            "",
+            "Open a notebook workspace:",
+            "",
+            *workspace_lines,
             LAB_URL_END,
         ]
     )
@@ -122,8 +186,9 @@ def main() -> int:
         site_url = args.site_url or infer_site_url(args.remote)
     site_url = site_url.rstrip("/") + "/"
     pyodide_url = site_url + "pyodide/pyodide.js"
+    workspaces = refresh_workspace_index(Path("."))
     patch_config(Path("jupyter-lite.json"), pyodide_url)
-    patch_readme(Path("README.md"), site_url + "lab/index.html")
+    patch_readme(Path("README.md"), site_url, workspaces)
     return 0
 
 

@@ -44,7 +44,22 @@ npm run build
 
 The local `build.py` script detects the GitHub repository from the `origin`
 remote and patches `jupyter-lite.json` so the Pyodide kernel loads from the
-correct GitHub Pages URL.
+correct GitHub Pages URL. It also rewrites the JupyterLab and notebook
+workspace links below.
+
+<!-- jupyterlite-lab-url:start -->
+## JupyterLab
+
+Open the notebook environment: [https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html)
+
+Open a notebook workspace:
+
+- [Polynomial Interpolation Instability](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/001-polynomial_interpolation)
+- [Pure Trig And Sounds](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/002-pure_trig_and_sounds)
+- [Pure Trig Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/003-pure_trig_fourier_matching_game)
+- [Square Wave Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/004-square_wave_fourier_matching_game)
+- [Products Of Fourier Modes](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/005-Products_of_fourier_modes)
+<!-- jupyterlite-lab-url:end -->
 
 To preview locally:
 
@@ -54,9 +69,3 @@ npm run serve
 ```
 
 Run `npm run build` again before pushing if you used `--local`.
-
-<!-- jupyterlite-lab-url:start -->
-## JupyterLab
-
-Open the notebook environment: [https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html)
-<!-- jupyterlite-lab-url:end -->

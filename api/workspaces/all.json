@@ -1,1 +1,472 @@
-{}
+{
+  "001-polynomial_interpolation": {
+    "data": {
+      "docmanager:recents": {
+        "closed": [],
+        "opened": [
+          {
+            "contentType": "directory",
+            "path": "",
+            "root": ""
+          },
+          {
+            "contentType": "notebook",
+            "factory": "Notebook",
+            "path": "001-polynomial_interpolation_instability.ipynb",
+            "root": ""
+          }
+        ]
+      },
+      "file-browser-filebrowser:columns": {
+        "sizes": {
+          "file_size": null,
+          "is_selected": 18,
+          "last_modified": 86.58333587646484,
+          "name": 139.75000762939453
+        }
+      },
+      "layout-restorer:data": {
+        "down": {
+          "size": 0,
+          "widgets": []
+        },
+        "left": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {
+            "jp-running-sessions": {
+              "expansionStates": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "sizes": [
+                0.25,
+                0.25,
+                0.25,
+                0.25
+              ]
+            }
+          },
+          "widgets": [
+            "filebrowser",
+            "running-sessions",
+            "@jupyterlab/toc:plugin"
+          ]
+        },
+        "main": {
+          "current": "notebook:001-polynomial_interpolation_instability.ipynb",
+          "dock": {
+            "currentIndex": 0,
+            "type": "tab-area",
+            "widgets": [
+              "notebook:001-polynomial_interpolation_instability.ipynb"
+            ]
+          }
+        },
+        "relativeSizes": [
+          0,
+          1,
+          0
+        ],
+        "right": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {},
+          "widgets": [
+            "jp-property-inspector"
+          ]
+        },
+        "top": {
+          "simpleVisibility": true
+        }
+      },
+      "notebook:001-polynomial_interpolation_instability.ipynb": {
+        "data": {
+          "factory": "Notebook",
+          "path": "001-polynomial_interpolation_instability.ipynb"
+        }
+      }
+    },
+    "metadata": {
+      "id": "001-polynomial_interpolation"
+    }
+  },
+  "002-pure_trig_and_sounds": {
+    "data": {
+      "docmanager:recents": {
+        "closed": [],
+        "opened": [
+          {
+            "contentType": "directory",
+            "path": "",
+            "root": ""
+          },
+          {
+            "contentType": "notebook",
+            "factory": "Notebook",
+            "path": "002-pure_trig_and_sounds.ipynb",
+            "root": ""
+          }
+        ]
+      },
+      "file-browser-filebrowser:columns": {
+        "sizes": {
+          "file_size": null,
+          "is_selected": 18,
+          "last_modified": 86.58333587646484,
+          "name": 139.75000762939453
+        }
+      },
+      "layout-restorer:data": {
+        "down": {
+          "size": 0,
+          "widgets": []
+        },
+        "left": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {
+            "jp-running-sessions": {
+              "expansionStates": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "sizes": [
+                0.25,
+                0.25,
+                0.25,
+                0.25
+              ]
+            }
+          },
+          "widgets": [
+            "filebrowser",
+            "running-sessions",
+            "@jupyterlab/toc:plugin"
+          ]
+        },
+        "main": {
+          "current": "notebook:002-pure_trig_and_sounds.ipynb",
+          "dock": {
+            "currentIndex": 0,
+            "type": "tab-area",
+            "widgets": [
+              "notebook:002-pure_trig_and_sounds.ipynb"
+            ]
+          }
+        },
+        "relativeSizes": [
+          0,
+          1,
+          0
+        ],
+        "right": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {},
+          "widgets": [
+            "jp-property-inspector"
+          ]
+        },
+        "top": {
+          "simpleVisibility": true
+        }
+      },
+      "notebook:002-pure_trig_and_sounds.ipynb": {
+        "data": {
+          "factory": "Notebook",
+          "path": "002-pure_trig_and_sounds.ipynb"
+        }
+      }
+    },
+    "metadata": {
+      "id": "002-pure_trig_and_sounds"
+    }
+  },
+  "003-pure_trig_fourier_matching_game": {
+    "data": {
+      "docmanager:recents": {
+        "closed": [],
+        "opened": [
+          {
+            "contentType": "directory",
+            "path": "",
+            "root": ""
+          },
+          {
+            "contentType": "notebook",
+            "factory": "Notebook",
+            "path": "003-pure_trig_fourier_matching_game.ipynb",
+            "root": ""
+          }
+        ]
+      },
+      "file-browser-filebrowser:columns": {
+        "sizes": {
+          "file_size": null,
+          "is_selected": 18,
+          "last_modified": 86.58333587646484,
+          "name": 139.75000762939453
+        }
+      },
+      "layout-restorer:data": {
+        "down": {
+          "size": 0,
+          "widgets": []
+        },
+        "left": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {
+            "jp-running-sessions": {
+              "expansionStates": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "sizes": [
+                0.25,
+                0.25,
+                0.25,
+                0.25
+              ]
+            }
+          },
+          "widgets": [
+            "filebrowser",
+            "running-sessions",
+            "@jupyterlab/toc:plugin"
+          ]
+        },
+        "main": {
+          "current": "notebook:003-pure_trig_fourier_matching_game.ipynb",
+          "dock": {
+            "currentIndex": 0,
+            "type": "tab-area",
+            "widgets": [
+              "notebook:003-pure_trig_fourier_matching_game.ipynb"
+            ]
+          }
+        },
+        "relativeSizes": [
+          0,
+          1,
+          0
+        ],
+        "right": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {},
+          "widgets": [
+            "jp-property-inspector"
+          ]
+        },
+        "top": {
+          "simpleVisibility": true
+        }
+      },
+      "notebook:003-pure_trig_fourier_matching_game.ipynb": {
+        "data": {
+          "factory": "Notebook",
+          "path": "003-pure_trig_fourier_matching_game.ipynb"
+        }
+      }
+    },
+    "metadata": {
+      "id": "003-pure_trig_fourier_matching_game"
+    }
+  },
+  "004-square_wave_fourier_matching_game": {
+    "data": {
+      "docmanager:recents": {
+        "closed": [],
+        "opened": [
+          {
+            "contentType": "directory",
+            "path": "",
+            "root": ""
+          },
+          {
+            "contentType": "notebook",
+            "factory": "Notebook",
+            "path": "004-square_wave_fourier_matching_game.ipynb",
+            "root": ""
+          }
+        ]
+      },
+      "file-browser-filebrowser:columns": {
+        "sizes": {
+          "file_size": null,
+          "is_selected": 18,
+          "last_modified": 86.58333587646484,
+          "name": 139.75000762939453
+        }
+      },
+      "layout-restorer:data": {
+        "down": {
+          "size": 0,
+          "widgets": []
+        },
+        "left": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {
+            "jp-running-sessions": {
+              "expansionStates": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "sizes": [
+                0.25,
+                0.25,
+                0.25,
+                0.25
+              ]
+            }
+          },
+          "widgets": [
+            "filebrowser",
+            "running-sessions",
+            "@jupyterlab/toc:plugin"
+          ]
+        },
+        "main": {
+          "current": "notebook:004-square_wave_fourier_matching_game.ipynb",
+          "dock": {
+            "currentIndex": 0,
+            "type": "tab-area",
+            "widgets": [
+              "notebook:004-square_wave_fourier_matching_game.ipynb"
+            ]
+          }
+        },
+        "relativeSizes": [
+          0,
+          1,
+          0
+        ],
+        "right": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {},
+          "widgets": [
+            "jp-property-inspector"
+          ]
+        },
+        "top": {
+          "simpleVisibility": true
+        }
+      },
+      "notebook:004-square_wave_fourier_matching_game.ipynb": {
+        "data": {
+          "factory": "Notebook",
+          "path": "004-square_wave_fourier_matching_game.ipynb"
+        }
+      }
+    },
+    "metadata": {
+      "id": "004-square_wave_fourier_matching_game"
+    }
+  },
+  "005-Products_of_fourier_modes": {
+    "data": {
+      "docmanager:recents": {
+        "closed": [],
+        "opened": [
+          {
+            "contentType": "directory",
+            "path": "",
+            "root": ""
+          },
+          {
+            "contentType": "notebook",
+            "factory": "Notebook",
+            "path": "005-Products_of_fourier_modes.ipynb",
+            "root": ""
+          }
+        ]
+      },
+      "file-browser-filebrowser:columns": {
+        "sizes": {
+          "file_size": null,
+          "is_selected": 18,
+          "last_modified": 86.58333587646484,
+          "name": 139.75000762939453
+        }
+      },
+      "layout-restorer:data": {
+        "down": {
+          "size": 0,
+          "widgets": []
+        },
+        "left": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {
+            "jp-running-sessions": {
+              "expansionStates": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "sizes": [
+                0.25,
+                0.25,
+                0.25,
+                0.25
+              ]
+            }
+          },
+          "widgets": [
+            "filebrowser",
+            "running-sessions",
+            "@jupyterlab/toc:plugin"
+          ]
+        },
+        "main": {
+          "current": "notebook:005-Products_of_fourier_modes.ipynb",
+          "dock": {
+            "currentIndex": 0,
+            "type": "tab-area",
+            "widgets": [
+              "notebook:005-Products_of_fourier_modes.ipynb"
+            ]
+          }
+        },
+        "relativeSizes": [
+          0,
+          1,
+          0
+        ],
+        "right": {
+          "collapsed": true,
+          "visible": true,
+          "widgetStates": {},
+          "widgets": [
+            "jp-property-inspector"
+          ]
+        },
+        "top": {
+          "simpleVisibility": true
+        }
+      },
+      "notebook:005-Products_of_fourier_modes.ipynb": {
+        "data": {
+          "factory": "Notebook",
+          "path": "005-Products_of_fourier_modes.ipynb"
+        }
+      }
+    },
+    "metadata": {
+      "id": "005-Products_of_fourier_modes"
+    }
+  }
+}
