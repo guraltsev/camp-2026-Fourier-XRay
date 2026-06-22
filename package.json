@@ -1,0 +1,8 @@
+{
+  "name": "math-toolkit-jupyterlite-site",
+  "private": true,
+  "scripts": {
+    "serve": "python -m http.server 8000",
+    "start": "npm run serve"
+  }
+}

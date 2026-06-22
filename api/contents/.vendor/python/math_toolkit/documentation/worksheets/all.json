@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.778079Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-21T19:14:07.488666Z",
+      "mimetype": null,
+      "name": "hamiltonian_dynamics.ipynb",
+      "path": ".vendor\\python\\math_toolkit\\documentation\\worksheets/hamiltonian_dynamics.ipynb",
+      "size": 10385466,
+      "type": "notebook",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T01:13:01.778079Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T01:13:01.778079Z",
+  "mimetype": null,
+  "name": ".vendor\\python\\math_toolkit\\documentation\\worksheets",
+  "path": ".vendor\\python\\math_toolkit\\documentation\\worksheets",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

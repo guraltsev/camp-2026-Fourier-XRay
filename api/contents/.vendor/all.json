@@ -1,0 +1,43 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.727371Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-22T01:12:37.988926Z",
+      "mimetype": "application/json",
+      "name": ".stage-local-packages.json",
+      "path": ".vendor/.stage-local-packages.json",
+      "size": 17632,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.730370Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-22T01:13:01.730370Z",
+      "mimetype": null,
+      "name": "python",
+      "path": ".vendor/python",
+      "size": null,
+      "type": "directory",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T01:13:01.725372Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T01:13:01.730370Z",
+  "mimetype": null,
+  "name": ".vendor",
+  "path": ".vendor",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-18T16:59:27.143692Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-18T16:59:09.976521Z",
+      "mimetype": "text/plain",
+      "name": "secret.txt",
+      "path": ".hidden/secret.txt",
+      "size": 24,
+      "type": "file",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-18T16:59:27.142678Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-18T16:59:27.143692Z",
+  "mimetype": null,
+  "name": ".hidden",
+  "path": ".hidden",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

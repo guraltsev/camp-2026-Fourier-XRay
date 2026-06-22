@@ -1,0 +1,3529 @@
+Directory structure:
+└── num/
+    ├── Readme.md
+    ├── __init__.py
+    ├── backend.py
+    ├── compile.py
+    ├── diagnostics.py
+    ├── discovery.py
+    ├── errors.py
+    ├── functions.py
+    ├── integration.py
+    ├── ivp.py
+    ├── operator.py
+    ├── shapes.py
+    ├── solve.py
+    ├── specs.py
+    └── types.py
+
+================================================
+FILE: Readme.md
+================================================
+# `math_toolkit.num`
+
+The `num` package owns the explicit numerical boundary for the toolkit.
+
+Use `Num` after symbolic preparation:
+
+```python
+f = sin(x) >> Num
+f(2)
+
+g = (x[i] + x[i + 1]) >> Num
+g([1, 2, 3, 4], 1)
+```
+
+Public concepts:
+
+- `Num` compiles an expression into a numeric value or `NumFunction`.
+- `NumFunction` binds positional arguments by fixed order and keyword
+  arguments by public names.
+- `Num.Scalar`, `Num.Index`, and `Num.Array(rank)` describe numeric roles.
+- `Num.Integrate(expr, ranges, domain_func=...)` integrates symbolic or
+  vectorized numeric functions with SciPy cubature.
+- Matrix output follows `sample shape + mathematical output shape`.
+- Held notation must be exposed explicitly with `Unhold` or `UnholdAll` before
+  numericalization.
+- Diagnostics are collected by default and can be shown or raised with
+  `warnings="show"` or `warnings="error"`.
+
+The backend is SciPy/NumPy. Public documentation describes mathematical roles
+and shape behavior; implementation details stay behind the compiler boundary.
+
+
+
+================================================
+FILE: __init__.py
+================================================
+"""Numerical execution layer for symbolic toolkit expressions."""
+
+from __future__ import annotations
+
+from .diagnostics import NumCompileWarning, NumDiagnostic
+from .errors import (
+    NumArgumentError,
+    NumCompilationError,
+    NumError,
+    NumHeldExpressionError,
+    NumRoleError,
+    NumSolverError,
+    NumUnsupportedExpressionError,
+)
+from .functions import ImplementedFunction, NumFunction
+from .ivp import IVP, SolveIVP
+from .operator import Num
+from .solve import Solve
+
+
+__all__ = [
+    "IVP",
+    "ImplementedFunction",
+    "Num",
+    "NumFunction",
+    "Solve",
+    "SolveIVP",
+    "NumArgumentError",
+    "NumCompilationError",
+    "NumCompileWarning",
+    "NumDiagnostic",
+    "NumError",
+    "NumHeldExpressionError",
+    "NumRoleError",
+    "NumSolverError",
+    "NumUnsupportedExpressionError",
+]
+
+
+
+================================================
+FILE: backend.py
+================================================
+"""Build SciPy/NumPy numerical callables for symbolic expressions."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+import sympy
+
+
+def build_backend_callable(
+    arg_symbols: tuple[object, ...],
+    expr: object,
+    *,
+    custom_impls: dict[str, object] | None = None,
+) -> Callable[..., Any]:
+    """Return a callable using the default SciPy/NumPy backend chain."""
+
+    if custom_impls is None:
+        custom_impls = {}
+    return sympy.lambdify(
+        arg_symbols,
+        expr,
+        modules=[custom_impls, "scipy", "numpy"],
+    )
+
+
+
+================================================
+FILE: compile.py
+================================================
+"""Compile symbolic expressions into numeric values or ``NumFunction`` objects."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import sympy
+
+from .diagnostics import (
+    NumDiagnostic,
+    WarningPolicy,
+    apply_warning_policy,
+    validate_warning_policy,
+)
+from .discovery import (
+    discover_roles,
+    lambdify_symbols_for_specs,
+    merge_explicit_and_discovered_roles,
+)
+from .errors import NumCompilationError
+from .functions import (
+    NumEvaluationContext,
+    NumFunction,
+    collect_implemented_functions,
+    implemented_modules,
+    make_call_cache,
+)
+from .shapes import build_output_evaluator
+from .specs import NumArgSpec, normalize_arg_specs
+
+
+def compile_num(
+    expr: object,
+    *,
+    args: tuple[Any, ...] = (),
+    warnings: object = "collect",
+    cache: object = False,
+) -> object:
+    """Compile an expression as a numeric value or ``NumFunction``."""
+
+    warning_policy = validate_warning_policy(warnings)
+    expression = _normalize_expression(expr)
+    explicit_specs = normalize_arg_specs(args)
+    implemented_functions = collect_implemented_functions(expression)
+
+    discovered_roles = discover_roles(expression)
+    final_specs = merge_explicit_and_discovered_roles(
+        explicit_specs,
+        discovered_roles,
+    )
+    diagnostics = _collect_diagnostics(expression)
+    apply_warning_policy(diagnostics, warning_policy)
+
+    arg_symbols = lambdify_symbols_for_specs(final_specs, discovered_roles)
+    context = NumEvaluationContext() if implemented_functions else None
+    custom_impls = (
+        implemented_modules(implemented_functions, context)
+        if context is not None
+        else None
+    )
+    raw, evaluator = build_output_evaluator(
+        expression,
+        arg_symbols,
+        custom_impls=custom_impls,
+    )
+
+    if not final_specs:
+        try:
+            return evaluator(())
+        except Exception as exc:
+            raise NumCompilationError(
+                f"Num could not evaluate {expression} as a numeric value."
+            ) from exc
+
+    execution_plan = _execution_plan_for(implemented_functions)
+    performance_notes = _performance_notes_for(implemented_functions)
+
+    return NumFunction(
+        symbolic_origin=expression,
+        args=final_specs,
+        backend="scipy/numpy",
+        raw=raw,
+        warnings=diagnostics,
+        _evaluator=evaluator,
+        execution_plan=execution_plan,
+        vectorized=True,
+        performance_notes=performance_notes,
+        _context=context,
+        _call_cache=make_call_cache(cache),
+        _implemented_functions=implemented_functions,
+    )
+
+
+def _normalize_expression(expr: object) -> object:
+    """Return a SymPy-compatible expression while preserving matrices."""
+
+    if isinstance(expr, sympy.MatrixBase | sympy.Basic):
+        return expr
+    try:
+        return sympy.sympify(expr)
+    except sympy.SympifyError:
+        return expr
+
+
+def _collect_diagnostics(expr: object) -> tuple[NumDiagnostic, ...]:
+    """Return compile-time diagnostics for valid but notable expressions."""
+
+    diagnostics: list[NumDiagnostic] = []
+    if isinstance(expr, sympy.MatrixBase):
+        diagnostics.append(
+            NumDiagnostic(
+                code="matrix-output-entrywise",
+                message=(
+                    "Matrix output is compiled entrywise so sample axes appear "
+                    "before mathematical output axes."
+                ),
+                expr=expr,
+            )
+        )
+
+    for part in _diagnostic_parts(expr):
+        if isinstance(part, sympy.Sum) and part.has(sympy.Indexed):
+            diagnostics.append(
+                NumDiagnostic(
+                    code="indexed-sum-python-loop",
+                    message=(
+                        "Finite indexed Sum compiled through SymPy's generated "
+                        "loop; vectorized lowering is not implemented yet."
+                    ),
+                    expr=part,
+                )
+            )
+    return tuple(diagnostics)
+
+
+def _execution_plan_for(implemented_functions: tuple[object, ...]) -> str:
+    """Return a public execution-plan label for a compiled expression."""
+
+    if not implemented_functions:
+        return "direct"
+    if any(component.required_parameters for component in implemented_functions):
+        return "solver-backed-lazy"
+    return "solver-backed-ready"
+
+
+def _performance_notes_for(implemented_functions: tuple[object, ...]) -> tuple[str, ...]:
+    """Return performance notes for solver-backed numeric functions."""
+
+    if not implemented_functions:
+        return ()
+
+    parameters: set[sympy.Symbol] = set()
+    for component in implemented_functions:
+        parameters.update(component.required_parameters)
+    if not parameters:
+        return (
+            "Uses an implemented symbolic solution and evaluates it through "
+            "Num over the independent variable.",
+        )
+
+    joined = ", ".join(symbol.name for symbol in sorted(parameters, key=lambda item: item.name))
+    return (
+        "Solves lazily when concrete parameter values are supplied.",
+        f"Varying parameter(s) {joined} creates distinct solver runs.",
+        "Solver results are cached by concrete parameter tuple.",
+    )
+
+
+def _diagnostic_parts(expr: object) -> tuple[object, ...]:
+    """Return expression nodes inspected for diagnostics."""
+
+    roots: tuple[object, ...]
+    if isinstance(expr, sympy.MatrixBase):
+        roots = tuple(expr[row, col] for row in range(expr.rows) for col in range(expr.cols))
+    else:
+        roots = (expr,)
+
+    parts: list[object] = []
+    for root in roots:
+        if isinstance(root, sympy.Basic):
+            parts.extend(sympy.preorder_traversal(root))
+    return tuple(parts)
+
+
+
+================================================
+FILE: diagnostics.py
+================================================
+"""Define diagnostics and warning policies for ``Num`` compilation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+import warnings as python_warnings
+
+from .errors import NumCompilationError
+
+WarningPolicy = Literal["collect", "show", "error"]
+
+
+@dataclass(frozen=True)
+class NumDiagnostic:
+    """Describe a non-fatal numerical compilation diagnostic.
+
+    Parameters
+    ----------
+    code : str
+        Stable machine-readable diagnostic identifier.
+    message : str
+        Human-readable explanation.
+    expr : object
+        Symbolic expression or subexpression associated with the diagnostic.
+    """
+
+    code: str
+    message: str
+    expr: object
+
+
+class NumCompileWarning(UserWarning):
+    """Warning category emitted by ``Num(warnings="show")``."""
+
+
+def validate_warning_policy(policy: object) -> WarningPolicy:
+    """Return a supported warning policy or raise a clear error."""
+
+    if policy in {"collect", "show", "error"}:
+        return policy
+    if policy == "ignore":
+        raise ValueError("Num warning policy 'ignore' is not supported.")
+    raise ValueError(
+        "Num warning policy must be 'collect', 'show', or 'error'."
+    )
+
+
+def apply_warning_policy(
+    diagnostics: tuple[NumDiagnostic, ...],
+    policy: WarningPolicy,
+) -> None:
+    """Apply the requested compile-time diagnostic policy."""
+
+    if not diagnostics or policy == "collect":
+        return
+
+    if policy == "show":
+        for diagnostic in diagnostics:
+            python_warnings.warn(
+                diagnostic.message,
+                NumCompileWarning,
+                stacklevel=3,
+            )
+        return
+
+    joined = "; ".join(
+        f"{diagnostic.code}: {diagnostic.message}"
+        for diagnostic in diagnostics
+    )
+    error = NumCompilationError(f"Num compilation produced diagnostics: {joined}")
+    error.diagnostics = diagnostics
+    raise error
+
+
+
+================================================
+FILE: discovery.py
+================================================
+"""Discover scalar, index, and array roles in symbolic expressions."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import sympy
+from sympy.core.function import AppliedUndef
+
+from ..holding import HeldExpression
+from .errors import (
+    NumHeldExpressionError,
+    NumRoleError,
+    NumUnsupportedExpressionError,
+)
+from .functions import implemented_function_from_application
+from .specs import NumArgSpec, make_indexed_base, visible_name
+from .types import INDEX, SCALAR, ArrayType, IndexType, NumericArgType
+
+
+@dataclass(frozen=True)
+class DiscoveredRole:
+    """Store one numeric role discovered from expression structure."""
+
+    name: str
+    symbol: object
+    type: NumericArgType
+    evidence: object
+    lambdify_symbol: object
+
+
+def discover_roles(expr: object) -> tuple[DiscoveredRole, ...]:
+    """Return numeric roles discovered from a symbolic expression."""
+
+    collector = _RoleCollector()
+    for part in _expression_parts(expr):
+        collector.visit(part, bound_symbols=frozenset(), index_context=False)
+    return collector.finalize()
+
+
+def merge_explicit_and_discovered_roles(
+    explicit_specs: tuple[NumArgSpec, ...],
+    discovered_roles: tuple[DiscoveredRole, ...],
+) -> tuple[NumArgSpec, ...]:
+    """Return final argument specs after validating explicit role choices."""
+
+    roles_by_name = {role.name: role for role in discovered_roles}
+    explicit_by_visible_name: set[str] = set()
+    final_specs: list[NumArgSpec] = []
+
+    # Explicit arguments own the leading call order, but their role cannot
+    # contradict the expression's structural evidence.
+    for spec in explicit_specs:
+        name = visible_name(spec.symbol)
+        role = roles_by_name.get(name)
+        if role is not None and role.type != spec.type:
+            raise NumRoleError(
+                f"Num argument {name} uses {spec.type!r}, but the expression "
+                f"uses {role.evidence} as {role.type!r}."
+            )
+        final_specs.append(spec)
+        explicit_by_visible_name.add(name)
+
+    # Any roles the user did not name explicitly remain part of the numeric
+    # function and are appended deterministically.
+    for role in sorted(discovered_roles, key=lambda item: item.name):
+        if role.name in explicit_by_visible_name:
+            continue
+        final_specs.append(
+            NumArgSpec(symbol=role.symbol, name=role.name, type=role.type)
+        )
+
+    return tuple(final_specs)
+
+
+def lambdify_symbols_for_specs(
+    specs: tuple[NumArgSpec, ...],
+    discovered_roles: tuple[DiscoveredRole, ...],
+) -> tuple[object, ...]:
+    """Return backend argument symbols matching public spec order."""
+
+    roles_by_name = {role.name: role for role in discovered_roles}
+    arg_symbols: list[object] = []
+    for spec in specs:
+        role = roles_by_name.get(visible_name(spec.symbol))
+        if isinstance(spec.type, ArrayType):
+            if role is not None:
+                arg_symbols.append(role.lambdify_symbol)
+            else:
+                arg_symbols.append(make_indexed_base(spec.symbol))
+            continue
+        arg_symbols.append(sympy.sympify(spec.symbol))
+    return tuple(arg_symbols)
+
+
+@dataclass(frozen=True)
+class _CandidateRole:
+    """Internal role evidence collected before conflict resolution."""
+
+    name: str
+    symbol: object
+    type: NumericArgType
+    evidence: object
+    lambdify_symbol: object
+
+
+class _RoleCollector:
+    """Collect numeric role evidence from a real expression tree walk."""
+
+    def __init__(self) -> None:
+        self._arrays: dict[str, list[_CandidateRole]] = {}
+        self._indices: dict[str, list[_CandidateRole]] = {}
+        self._scalars: dict[str, list[_CandidateRole]] = {}
+        self._bound_names: set[str] = set()
+
+    def visit(
+        self,
+        value: object,
+        *,
+        bound_symbols: frozenset[sympy.Symbol],
+        index_context: bool,
+    ) -> None:
+        """Visit one expression node and update collected role candidates."""
+
+        implemented_function = implemented_function_from_application(value)
+        if implemented_function is not None:
+            for parameter in implemented_function.required_parameters:
+                self._record_scalar_symbol(parameter)
+            for argument in value.args:
+                self.visit(
+                    argument,
+                    bound_symbols=bound_symbols,
+                    index_context=index_context,
+            )
+            return
+
+        self._raise_for_held_or_opaque(value)
+
+        if isinstance(value, sympy.Indexed):
+            element_type = INDEX if index_context else SCALAR
+            self._record_indexed(value, element_type=element_type)
+            for index in value.indices:
+                self.visit(
+                    index,
+                    bound_symbols=bound_symbols,
+                    index_context=True,
+                )
+            return
+
+        if isinstance(value, sympy.IndexedBase):
+            raise NumRoleError(
+                f"Num cannot infer an array role from bare IndexedBase {value}. "
+                "Use indexed access such as x[i] or pass an explicit "
+                "Num.Array(...) argument."
+            )
+
+        if isinstance(value, sympy.Symbol):
+            if value in bound_symbols:
+                return
+            if index_context:
+                self._record_index_symbol(value)
+            else:
+                self._record_scalar_symbol(value)
+            return
+
+        if not isinstance(value, sympy.Basic):
+            try:
+                sympified = sympy.sympify(value)
+            except sympy.SympifyError as exc:
+                raise NumUnsupportedExpressionError(
+                    f"Num cannot compile unsupported expression {value!r}."
+                ) from exc
+            if sympified is not value:
+                self.visit(
+                    sympified,
+                    bound_symbols=bound_symbols,
+                    index_context=index_context,
+                )
+            return
+
+        local_bound = self._bound_symbols_from(value)
+        next_bound = bound_symbols | local_bound
+        for symbol in local_bound:
+            self._bound_names.add(visible_name(symbol))
+
+        for child in value.args:
+            self.visit(
+                child,
+                bound_symbols=next_bound,
+                index_context=index_context,
+            )
+
+    def finalize(self) -> tuple[DiscoveredRole, ...]:
+        """Return conflict-checked discovered roles."""
+
+        array_roles = self._resolve_same_named_candidates(self._arrays)
+        index_roles = self._resolve_same_named_candidates(self._indices)
+        scalar_roles = self._resolve_same_named_candidates(self._scalars)
+
+        # Index roles are integer scalar arguments, so ordinary arithmetic uses
+        # of the same symbol are allowed to ride along with the index role.
+        for name in list(scalar_roles):
+            if name in index_roles:
+                scalar_roles.pop(name)
+
+        for name, array_role in array_roles.items():
+            scalar_role = scalar_roles.get(name)
+            if scalar_role is not None:
+                raise NumRoleError(
+                    f"Num found conflicting numeric roles for {name!r}: "
+                    f"scalar use {scalar_role.evidence} and array use "
+                    f"{array_role.evidence}. Pass explicit Num arguments or "
+                    "rename one role before numericalization."
+                )
+            index_role = index_roles.get(name)
+            if index_role is not None:
+                raise NumRoleError(
+                    f"Num found conflicting numeric roles for {name!r}: "
+                    f"index use {index_role.evidence} and array use "
+                    f"{array_role.evidence}. Pass explicit Num arguments or "
+                    "rename one role before numericalization."
+                )
+
+        for name, index_role in index_roles.items():
+            if name in self._bound_names:
+                raise NumRoleError(
+                    f"Num found index symbol {name!r} used as both a bound "
+                    f"dummy and an external index role near {index_role.evidence}."
+                )
+
+        roles: list[DiscoveredRole] = []
+        roles.extend(array_roles.values())
+        roles.extend(index_roles.values())
+        roles.extend(scalar_roles.values())
+        return tuple(sorted(roles, key=lambda item: item.name))
+
+    def _record_indexed(
+        self,
+        indexed: sympy.Indexed,
+        *,
+        element_type: IndexType | object,
+    ) -> None:
+        """Record one indexed array access."""
+
+        base = indexed.base
+        name = visible_name(base)
+        public_symbol = _public_symbol_for_indexed_base(base)
+        role_type = ArrayType(len(indexed.indices), element_type)
+        self._arrays.setdefault(name, []).append(
+            _CandidateRole(
+                name=name,
+                symbol=public_symbol,
+                type=role_type,
+                evidence=indexed,
+                lambdify_symbol=base,
+            )
+        )
+
+    def _record_index_symbol(self, symbol: sympy.Symbol) -> None:
+        """Record a free index argument."""
+
+        name = visible_name(symbol)
+        self._indices.setdefault(name, []).append(
+            _CandidateRole(
+                name=name,
+                symbol=symbol,
+                type=INDEX,
+                evidence=symbol,
+                lambdify_symbol=symbol,
+            )
+        )
+
+    def _record_scalar_symbol(self, symbol: sympy.Symbol) -> None:
+        """Record an ordinary scalar argument candidate."""
+
+        name = visible_name(symbol)
+        self._scalars.setdefault(name, []).append(
+            _CandidateRole(
+                name=name,
+                symbol=symbol,
+                type=SCALAR,
+                evidence=symbol,
+                lambdify_symbol=symbol,
+            )
+        )
+
+    def _resolve_same_named_candidates(
+        self,
+        candidates_by_name: dict[str, list[_CandidateRole]],
+    ) -> dict[str, DiscoveredRole]:
+        """Return one role per name, raising when evidence disagrees."""
+
+        resolved: dict[str, DiscoveredRole] = {}
+        for name, candidates in candidates_by_name.items():
+            first = candidates[0]
+            for candidate in candidates[1:]:
+                if candidate.type != first.type:
+                    raise NumRoleError(
+                        f"Num found conflicting numeric roles for {name!r}: "
+                        f"use {first.evidence} as {first.type!r} and "
+                        f"use {candidate.evidence} as {candidate.type!r}."
+                    )
+            resolved[name] = DiscoveredRole(
+                name=first.name,
+                symbol=first.symbol,
+                type=first.type,
+                evidence=first.evidence,
+                lambdify_symbol=first.lambdify_symbol,
+            )
+        return resolved
+
+    def _bound_symbols_from(
+        self,
+        value: sympy.Basic,
+    ) -> frozenset[sympy.Symbol]:
+        """Return local bound symbols declared by a SymPy node."""
+
+        raw_bound = getattr(value, "bound_symbols", ())
+        if not raw_bound:
+            return frozenset()
+        return frozenset(
+            symbol for symbol in raw_bound if isinstance(symbol, sympy.Symbol)
+        )
+
+    def _raise_for_held_or_opaque(self, value: object) -> None:
+        """Reject symbolic boundaries that ``Num`` does not cross implicitly."""
+
+        if isinstance(value, HeldExpression) or _is_held_named_expression(value):
+            raise NumHeldExpressionError(
+                f"Num cannot compile held notation {value}. Use expr >> "
+                "UnholdAll >> Num when you want to expose held definitions first."
+            )
+
+        if _is_opaque_named_expression(value):
+            raise NumUnsupportedExpressionError(
+                f"Num cannot compile the opaque named expression {value}. "
+                "Expose a definition with UnholdAll before Num when one exists."
+            )
+
+        if isinstance(value, sympy.Function):
+            if getattr(value.func, "_math_toolkit_held", False):
+                raise NumHeldExpressionError(
+                    f"Num cannot compile held notation {value}. Use expr >> "
+                    "UnholdAll >> Num when you want to expose held definitions first."
+                )
+            if isinstance(value, AppliedUndef):
+                if hasattr(value.func, "_mt_indices") or hasattr(
+                    value.func,
+                    "_math_toolkit_indices",
+                ):
+                    raise NumUnsupportedExpressionError(
+                        f"Num cannot compile the opaque function call {value}. "
+                        "Expose a definition with UnholdAll before Num, or "
+                        "provide an explicit numeric implementation when that "
+                        "API exists."
+                    )
+                raise NumUnsupportedExpressionError(
+                    f"Num cannot compile the opaque function call {value}. "
+                    "Expose a definition with UnholdAll before Num, or provide "
+                    "an explicit numeric implementation when that API exists."
+                )
+            if hasattr(value.func, "_math_toolkit_definitions"):
+                raise NumUnsupportedExpressionError(
+                    f"Num cannot compile the opaque function call {value}. "
+                    "Expose a definition with UnholdAll before Num, or provide "
+                    "an explicit numeric implementation when that API exists."
+                )
+
+
+def _expression_parts(expr: object) -> tuple[object, ...]:
+    """Return traversable expression parts while preserving matrix entries."""
+
+    if isinstance(expr, sympy.MatrixBase):
+        return tuple(expr[row, col] for row in range(expr.rows) for col in range(expr.cols))
+    return (expr,)
+
+
+def _public_symbol_for_indexed_base(base: sympy.IndexedBase) -> object:
+    """Return the public symbol represented by an indexed base."""
+
+    label = base.label
+    if isinstance(label, sympy.Symbol):
+        return label
+    return sympy.Symbol(str(label))
+
+
+def _is_held_named_expression(value: object) -> bool:
+    """Return whether ``value`` is a held named-expression boundary."""
+
+    family = getattr(value, "_math_toolkit_family", None)
+    if family is not None and getattr(family, "_math_toolkit_held", False):
+        return True
+    return bool(
+        getattr(value, "_math_toolkit_held", False)
+        and hasattr(value, "_math_toolkit_definitions")
+    )
+
+
+def _is_opaque_named_expression(value: object) -> bool:
+    """Return whether ``value`` is an opaque named expression."""
+
+    return hasattr(value, "_math_toolkit_family")
+
+
+
+================================================
+FILE: errors.py
+================================================
+"""Define public exceptions raised by the numerical layer."""
+
+from __future__ import annotations
+
+
+class NumError(Exception):
+    """Base class for numerical-layer errors."""
+
+
+class NumRoleError(NumError):
+    """Report incompatible symbolic roles during numericalization."""
+
+
+class NumArgumentError(NumError):
+    """Report invalid ``Num`` argument specifications or call arguments."""
+
+
+class NumCompilationError(NumError):
+    """Report expressions that cannot be compiled for numeric execution."""
+
+
+class NumSolverError(NumError):
+    """Report numerical solver failures through toolkit language."""
+
+
+class NumHeldExpressionError(NumCompilationError):
+    """Report held notation passed across the numerical boundary."""
+
+
+class NumUnsupportedExpressionError(NumCompilationError):
+    """Report symbolic forms with no MVP numeric execution semantics."""
+
+
+
+================================================
+FILE: functions.py
+================================================
+"""Represent public numeric callables and implemented symbolic functions."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from itertools import count
+
+import numpy as np
+import sympy
+
+from .diagnostics import NumDiagnostic
+from .errors import NumArgumentError
+from .specs import NumArgSpec
+
+_IMPLEMENTED_FUNCTION_COUNTER = count()
+
+
+@dataclass
+class _CallCache:
+    """Store optional public ``NumFunction`` call results."""
+
+    enabled: bool
+    maxsize: int | None
+    values: OrderedDict[tuple[object, ...], object] = field(default_factory=OrderedDict)
+    hits: int = 0
+    misses: int = 0
+
+    def get_or_compute(
+        self,
+        values: tuple[object, ...],
+        compute: Callable[[], object],
+    ) -> object:
+        """Return a cached result when public call caching is enabled."""
+
+        if not self.enabled:
+            return compute()
+
+        key = _hashable_values(values)
+        if key is None:
+            self.misses += 1
+            return compute()
+
+        if key in self.values:
+            self.hits += 1
+            self.values.move_to_end(key)
+            return self.values[key]
+
+        self.misses += 1
+        result = compute()
+        self.values[key] = result
+        self.values.move_to_end(key)
+        if self.maxsize is not None:
+            while len(self.values) > self.maxsize:
+                self.values.popitem(last=False)
+        return result
+
+    def info(self) -> dict[str, object]:
+        """Return public cache counters without exposing cached values."""
+
+        return {
+            "enabled": self.enabled,
+            "size": len(self.values),
+            "maxsize": self.maxsize,
+            "hits": self.hits,
+            "misses": self.misses,
+        }
+
+    def clear(self) -> None:
+        """Remove stored results and reset cache counters."""
+
+        self.values.clear()
+        self.hits = 0
+        self.misses = 0
+
+
+class NumEvaluationContext:
+    """Expose bound ``NumFunction`` arguments to implemented callables."""
+
+    def __init__(self) -> None:
+        self._bound: dict[object, object] | None = None
+
+    def bind(
+        self,
+        specs: tuple[NumArgSpec, ...],
+        values: tuple[object, ...],
+    ) -> None:
+        """Make one public call's arguments visible during evaluation."""
+
+        bound: dict[object, object] = {}
+        for spec, value in zip(specs, values):
+            bound[spec.symbol] = value
+            bound[spec.name] = value
+            if isinstance(spec.symbol, sympy.Symbol):
+                bound[spec.symbol.name] = value
+        self._bound = bound
+
+    def clear(self) -> None:
+        """Leave the active public-call context."""
+
+        self._bound = None
+
+    def parameter_values(
+        self,
+        parameters: tuple[sympy.Symbol, ...],
+    ) -> dict[sympy.Symbol, object]:
+        """Return scalar parameter values for a solver-backed function."""
+
+        if self._bound is None:
+            raise NumArgumentError(
+                "Implemented functions can only be evaluated through Num."
+            )
+
+        values: dict[sympy.Symbol, object] = {}
+        for parameter in parameters:
+            if parameter in self._bound:
+                value = self._bound[parameter]
+            elif parameter.name in self._bound:
+                value = self._bound[parameter.name]
+            else:
+                raise NumArgumentError(
+                    f"Missing numeric value for solver parameter `{parameter}`."
+                )
+
+            array = np.asarray(value)
+            if array.shape != ():
+                raise NumArgumentError(
+                    f"Parameter `{parameter}` received an array. This would "
+                    "require many separate solver runs. Use an explicit sweep "
+                    "API or loop intentionally."
+                )
+            values[parameter] = array.item()
+        return values
+
+
+@dataclass(frozen=True)
+class NumFunction:
+    """Represent a reusable numeric callable produced by ``Num``.
+
+    Parameters
+    ----------
+    symbolic_origin : object
+        Original symbolic expression compiled for numeric execution.
+    args : tuple[NumArgSpec, ...]
+        Numeric argument specs in call order.
+    backend : str
+        Public backend description.
+    raw : object
+        Underlying generated callable or callable bundle.
+    warnings : tuple[NumDiagnostic, ...]
+        Compile-time diagnostics collected for this function.
+
+    Methods
+    -------
+    __call__
+        Evaluate the numeric function with positional and keyword arguments.
+    cache_info
+        Return public cache counters for call and solver caches.
+    clear_cache
+        Clear private operational caches owned by this function.
+    explain
+        Return a short human-readable execution summary.
+    """
+
+    symbolic_origin: object
+    args: tuple[NumArgSpec, ...]
+    backend: str
+    raw: object = field(compare=False, hash=False)
+    warnings: tuple[NumDiagnostic, ...]
+    _evaluator: Callable[[tuple[object, ...]], object] = field(
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+    execution_plan: str = "direct"
+    vectorized: bool = True
+    performance_notes: tuple[str, ...] = ()
+    _context: NumEvaluationContext | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+    _call_cache: _CallCache = field(
+        default_factory=lambda: _CallCache(enabled=False, maxsize=None),
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+    _implemented_functions: tuple["ImplementedFunction", ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+
+    @property
+    def num_role(self) -> str:
+        """Return the symbolic/numeric boundary role name."""
+
+        return "num-function"
+
+    @property
+    def expr(self) -> object:
+        """Return the expression compiled by this numeric function."""
+
+        return self.symbolic_origin
+
+    @property
+    def arguments(self) -> tuple[NumArgSpec, ...]:
+        """Return public argument specifications in call order."""
+
+        return self.args
+
+    @property
+    def diagnostics(self) -> tuple[NumDiagnostic, ...]:
+        """Return compile-time diagnostics collected for this function."""
+
+        return self.warnings
+
+    def __call__(self, *values: object, **kwargs: object) -> object:
+        """Evaluate the numeric function with bound arguments."""
+
+        if len(values) > len(self.args):
+            raise TypeError(
+                f"{self!r} expected at most {len(self.args)} positional "
+                f"arguments, got {len(values)}."
+            )
+
+        bound: dict[str, object] = {}
+        for spec, value in zip(self.args, values):
+            bound[spec.name] = value
+
+        argument_names = {spec.name for spec in self.args}
+        for name, value in kwargs.items():
+            if name not in argument_names:
+                raise TypeError(f"{self!r} got an unknown argument {name!r}.")
+            if name in bound:
+                raise TypeError(f"{self!r} got multiple values for argument {name!r}.")
+            bound[name] = value
+
+        missing = [spec.name for spec in self.args if spec.name not in bound]
+        if missing:
+            joined = ", ".join(missing)
+            raise TypeError(f"{self!r} missing required argument(s): {joined}.")
+
+        ordered_values = tuple(bound[spec.name] for spec in self.args)
+
+        def compute() -> object:
+            if self._context is None:
+                return self._evaluator(ordered_values)
+            self._context.bind(self.args, ordered_values)
+            try:
+                return self._evaluator(ordered_values)
+            finally:
+                self._context.clear()
+
+        return self._call_cache.get_or_compute(ordered_values, compute)
+
+    def __repr__(self) -> str:
+        """Return a concise notebook-facing representation."""
+
+        names = ", ".join(spec.name for spec in self.args)
+        return f"NumFunction[{names}]"
+
+    def cache_info(self) -> dict[str, object]:
+        """Return public information about private operational caches."""
+
+        solver_caches: dict[str, object] = {}
+        seen_branches: set[int] = set()
+        for component in self._implemented_functions:
+            branch = component.branch
+            identity = id(branch)
+            if identity in seen_branches:
+                continue
+            seen_branches.add(identity)
+            solver_caches[branch.cache_label] = branch.cache_info()
+
+        return {
+            "call_cache": self._call_cache.info(),
+            "solver_caches": solver_caches,
+        }
+
+    def clear_cache(self) -> None:
+        """Clear private call and solver caches."""
+
+        self._call_cache.clear()
+        seen_branches: set[int] = set()
+        for component in self._implemented_functions:
+            branch = component.branch
+            identity = id(branch)
+            if identity in seen_branches:
+                continue
+            seen_branches.add(identity)
+            branch.clear_cache()
+
+    def explain(self) -> str:
+        """Return a short explanation of the numeric execution plan."""
+
+        lines = [
+            f"num_role: {self.num_role}",
+            f"execution_plan: {self.execution_plan}",
+            f"backend: {self.backend}",
+        ]
+        if self.performance_notes:
+            lines.append("performance_notes:")
+            lines.extend(f"- {note}" for note in self.performance_notes)
+        if self.diagnostics:
+            lines.append("diagnostics:")
+            lines.extend(
+                f"- {diagnostic.code}: {diagnostic.message}"
+                for diagnostic in self.diagnostics
+            )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ImplementedFunction:
+    """Represent a symbolic function with an attached numeric implementation.
+
+    Parameters
+    ----------
+    display_name : str
+        Human-readable function name used for symbolic applications.
+    branch : object
+        Implemented solution branch that owns component evaluation.
+    component_key : object
+        Public key used to select the component from the branch.
+    component_index : int
+        Positional component index in the numeric solution vector.
+
+    Methods
+    -------
+    __call__
+        Apply the symbolic function to its independent variable.
+    subs
+        Return a specialized implemented function after symbolic substitution.
+    explain
+        Return a short human-readable implementation summary.
+    """
+
+    display_name: str
+    branch: object
+    component_key: object
+    component_index: int
+    _head: object = field(init=False, repr=False, compare=False, hash=False)
+
+    def __post_init__(self) -> None:
+        """Create a unique SymPy function head for this implementation."""
+
+        suffix = next(_IMPLEMENTED_FUNCTION_COUNTER)
+        safe_name = _safe_function_name(self.display_name)
+        head = sympy.Function(f"{safe_name}_implemented_{suffix}")
+        head._math_toolkit_implemented_function = self
+        object.__setattr__(self, "_head", head)
+
+    @property
+    def num_role(self) -> str:
+        """Return the symbolic/numeric boundary role name."""
+
+        return "implemented-function"
+
+    @property
+    def symbolic_origin(self) -> object:
+        """Return the symbolic problem that produced this function."""
+
+        return self.branch.symbolic_origin
+
+    @property
+    def implementation_status(self) -> str:
+        """Return whether the component is ready or parameterized."""
+
+        return self.branch.implementation_status
+
+    @property
+    def required_parameters(self) -> tuple[sympy.Symbol, ...]:
+        """Return unresolved solver parameters in deterministic order."""
+
+        return self.branch.required_parameters
+
+    @property
+    def independent_variables(self) -> tuple[sympy.Symbol, ...]:
+        """Return independent variables accepted by this function."""
+
+        return self.branch.independent_variables
+
+    @property
+    def domain(self) -> tuple[object, object, object]:
+        """Return the independent-variable domain of the component."""
+
+        return self.branch.domain
+
+    @property
+    def vectorized(self) -> bool:
+        """Return whether the implementation accepts array sample inputs."""
+
+        return True
+
+    @property
+    def diagnostics(self) -> tuple[object, ...]:
+        """Return diagnostics attached to the owning branch."""
+
+        return self.branch.diagnostics
+
+    def __call__(self, variable: object) -> object:
+        """Return a symbolic application of the implemented function."""
+
+        return self._head(variable)
+
+    def subs(self, *args: object, **kwargs: object) -> "ImplementedFunction":
+        """Return this component after substituting in the owning branch."""
+
+        return self.branch.subs(*args, **kwargs)[self.component_key]
+
+    def xreplace(self, rule: Mapping[object, object]) -> "ImplementedFunction":
+        """Return this component after exact replacement in the branch."""
+
+        return self.branch.xreplace(rule)[self.component_key]
+
+    def evaluate(
+        self,
+        function_args: tuple[object, ...],
+        parameter_values: dict[sympy.Symbol, object],
+    ) -> object:
+        """Evaluate this component through the owning solution branch."""
+
+        if len(function_args) != 1:
+            raise NumArgumentError(
+                "Implemented IVP functions accept exactly one independent "
+                "variable argument."
+            )
+        return self.branch.evaluate_component(
+            self.component_index,
+            function_args[0],
+            parameter_values,
+        )
+
+    def explain(self) -> str:
+        """Return a short explanation of this implemented function."""
+
+        return (
+            f"num_role: {self.num_role}\n"
+            f"implementation_status: {self.implementation_status}\n"
+            f"required_parameters: {self.required_parameters}"
+        )
+
+    def __repr__(self) -> str:
+        """Return a concise component representation."""
+
+        return f"ImplementedFunction[{self.display_name}]"
+
+
+def make_call_cache(cache: object) -> _CallCache:
+    """Return a private call cache from the public ``Num(cache=...)`` option."""
+
+    if cache is False or cache is None:
+        return _CallCache(enabled=False, maxsize=None)
+    if cache is True:
+        return _CallCache(enabled=True, maxsize=None)
+    if isinstance(cache, dict):
+        unknown = sorted(set(cache) - {"maxsize"})
+        if unknown:
+            joined = ", ".join(unknown)
+            raise NumArgumentError(f"Unknown Num cache option(s): {joined}.")
+        maxsize = cache.get("maxsize")
+        if maxsize is not None:
+            if not isinstance(maxsize, int) or isinstance(maxsize, bool):
+                raise NumArgumentError("Num cache maxsize must be an integer.")
+            if maxsize < 1:
+                raise NumArgumentError("Num cache maxsize must be positive.")
+        return _CallCache(enabled=True, maxsize=maxsize)
+    raise NumArgumentError("Num cache must be False, True, or {'maxsize': n}.")
+
+
+def implemented_function_from_application(value: object) -> ImplementedFunction | None:
+    """Return the implemented function represented by a SymPy application."""
+
+    if not isinstance(value, sympy.Function):
+        return None
+    component = getattr(value.func, "_math_toolkit_implemented_function", None)
+    if isinstance(component, ImplementedFunction):
+        return component
+    return None
+
+
+def collect_implemented_functions(expr: object) -> tuple[ImplementedFunction, ...]:
+    """Return implemented functions found in a symbolic expression."""
+
+    functions: list[ImplementedFunction] = []
+    seen: set[int] = set()
+    for part in _expression_parts(expr):
+        if not isinstance(part, sympy.Basic):
+            continue
+        for node in sympy.preorder_traversal(part):
+            component = implemented_function_from_application(node)
+            if component is None:
+                continue
+            identity = id(component)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            functions.append(component)
+    return tuple(functions)
+
+
+def implemented_modules(
+    functions: tuple[ImplementedFunction, ...],
+    context: NumEvaluationContext,
+) -> dict[str, object]:
+    """Return lambdify module bindings for implemented symbolic functions."""
+
+    modules: dict[str, object] = {}
+    for component in functions:
+        modules[component._head.__name__] = _implemented_callable(component, context)
+    return modules
+
+
+def _implemented_callable(
+    component: ImplementedFunction,
+    context: NumEvaluationContext,
+) -> Callable[..., object]:
+    """Return a lambdify callback for one implemented component."""
+
+    def evaluate(*function_args: object) -> object:
+        parameter_values = context.parameter_values(component.required_parameters)
+        return component.evaluate(function_args, parameter_values)
+
+    return evaluate
+
+
+def _expression_parts(expr: object) -> tuple[object, ...]:
+    """Return traversable expression parts while preserving matrix entries."""
+
+    if isinstance(expr, sympy.MatrixBase):
+        return tuple(expr[row, col] for row in range(expr.rows) for col in range(expr.cols))
+    return (expr,)
+
+
+def _hashable_values(values: tuple[object, ...]) -> tuple[object, ...] | None:
+    """Return a hashable call key, or ``None`` for uncacheable values."""
+
+    key: list[object] = []
+    for value in values:
+        array = np.asarray(value)
+        if array.shape != ():
+            return None
+        item = array.item()
+        try:
+            hash(item)
+        except TypeError:
+            return None
+        key.append(item)
+    return tuple(key)
+
+
+def _safe_function_name(name: str) -> str:
+    """Return a Python identifier suitable for SymPy lambdify output."""
+
+    characters = [character if character.isalnum() else "_" for character in name]
+    safe = "".join(characters).strip("_")
+    if not safe or safe[0].isdigit():
+        safe = f"f_{safe}"
+    return safe
+
+
+
+================================================
+FILE: integration.py
+================================================
+"""Integrate numeric and symbolic functions with SciPy cubature."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.integrate import cubature
+import sympy
+
+from ..sympy_extensions.sympy_ifdsl import If
+from .compile import compile_num
+from .errors import NumArgumentError
+from .functions import NumFunction
+
+
+@dataclass(frozen=True)
+class _CubatureRectangle:
+    """Store normalized cubature bounds and optional coordinate symbols."""
+
+    symbols: tuple[sympy.Symbol | None, ...]
+    lower: np.ndarray
+    upper: np.ndarray
+
+
+def integrate(
+    function: object,
+    ranges: object,
+    *,
+    domain_func: object | None = None,
+    args: tuple[object, ...] = (),
+    rule: str = "gk21",
+    rtol: float = 1e-8,
+    atol: float = 0.0,
+    max_subdivisions: int = 10000,
+    workers: int | Callable[..., object] = 1,
+    points: object | None = None,
+) -> object:
+    """Integrate a vectorized function over a rectangular cubature domain.
+
+    Parameters
+    ----------
+    function : object
+        Symbolic expression, compiled ``NumFunction``, or vectorized Python
+        callable to integrate.
+    ranges : object
+        Rectangular bounds. Use ``[(x, a, b), (y, c, d)]`` for symbolic
+        integrands or ``[(a, b), (c, d)]`` for purely numeric integrands.
+    domain_func : object, optional
+        Symbolic expression or vectorized Python callable that is negative
+        inside the desired domain and positive outside it.
+    args : tuple[object, ...], optional
+        Extra positional arguments passed after the coordinate arrays.
+    rule : str, optional
+        Cubature rule passed to :func:`scipy.integrate.cubature`.
+    rtol : float, optional
+        Relative integration tolerance.
+    atol : float, optional
+        Absolute integration tolerance.
+    max_subdivisions : int, optional
+        Maximum cubature subdivisions.
+    workers : int or callable, optional
+        Worker configuration passed to SciPy.
+    points : object, optional
+        Points passed to SciPy for avoiding singularities.
+
+    Returns
+    -------
+    object
+        SciPy ``CubatureResult`` containing the integral estimate and error.
+    """
+
+    rectangle = _normalize_rectangle(ranges)
+    coordinate_symbols = _coordinate_symbols_for(
+        rectangle,
+        function=function,
+        domain_func=domain_func,
+    )
+    callback = _cubature_callback(
+        function,
+        domain_func=domain_func,
+        coordinate_symbols=coordinate_symbols,
+        args=args,
+    )
+    return cubature(
+        callback,
+        rectangle.lower,
+        rectangle.upper,
+        rule=rule,
+        rtol=rtol,
+        atol=atol,
+        max_subdivisions=max_subdivisions,
+        workers=workers,
+        points=points,
+    )
+
+
+def _normalize_rectangle(ranges: object) -> _CubatureRectangle:
+    """Return coordinate symbols and numeric endpoints from public ranges."""
+
+    entries = _range_entries(ranges)
+    symbols: list[sympy.Symbol | None] = []
+    lower: list[float] = []
+    upper: list[float] = []
+
+    for entry in entries:
+        symbol, left, right = _normalize_range_entry(entry)
+        symbols.append(symbol)
+        lower.append(float(left))
+        upper.append(float(right))
+
+    if not lower:
+        raise NumArgumentError("Num.Integrate requires at least one interval.")
+    return _CubatureRectangle(
+        symbols=tuple(symbols),
+        lower=np.asarray(lower, dtype=float),
+        upper=np.asarray(upper, dtype=float),
+    )
+
+
+def _range_entries(ranges: object) -> tuple[object, ...]:
+    """Return interval entries while accepting a convenient one-dimensional form."""
+
+    if not isinstance(ranges, Sequence) or isinstance(ranges, str | bytes):
+        raise NumArgumentError(
+            "Num.Integrate ranges must be an interval or a sequence of intervals."
+        )
+    if len(ranges) == 2 and not _looks_like_nested_intervals(ranges):
+        return (ranges,)
+    if len(ranges) == 3 and isinstance(ranges[0], sympy.Symbol):
+        return (ranges,)
+    return tuple(ranges)
+
+
+def _looks_like_nested_intervals(ranges: Sequence[object]) -> bool:
+    """Return whether a length-two value already looks like two intervals."""
+
+    return all(
+        isinstance(entry, Sequence)
+        and not isinstance(entry, str | bytes)
+        and len(entry) in {2, 3}
+        for entry in ranges
+    )
+
+
+def _normalize_range_entry(
+    entry: object,
+) -> tuple[sympy.Symbol | None, object, object]:
+    """Return ``(symbol, lower, upper)`` for one interval entry."""
+
+    if not isinstance(entry, Sequence) or isinstance(entry, str | bytes):
+        raise NumArgumentError(
+            "Each Num.Integrate interval must be (lower, upper), "
+            "(symbol, lower, upper), or (symbol, (lower, upper))."
+        )
+
+    if len(entry) == 2:
+        first, second = entry
+        if isinstance(first, sympy.Symbol):
+            if (
+                not isinstance(second, Sequence)
+                or isinstance(second, str | bytes)
+                or len(second) != 2
+            ):
+                raise NumArgumentError(
+                    "Symbolic Num.Integrate intervals must include two bounds."
+                )
+            lower, upper = second
+            return first, lower, upper
+        return None, first, second
+
+    if len(entry) == 3 and isinstance(entry[0], sympy.Symbol):
+        symbol, lower, upper = entry
+        return symbol, lower, upper
+
+    raise NumArgumentError(
+        "Each Num.Integrate interval must be (lower, upper), "
+        "(symbol, lower, upper), or (symbol, (lower, upper))."
+    )
+
+
+def _coordinate_symbols_for(
+    rectangle: _CubatureRectangle,
+    *,
+    function: object,
+    domain_func: object | None,
+) -> tuple[sympy.Symbol, ...] | None:
+    """Return coordinate symbols when symbolic expressions need compilation."""
+
+    explicit_symbols = tuple(symbol for symbol in rectangle.symbols if symbol is not None)
+    if len(explicit_symbols) != len(rectangle.symbols) and explicit_symbols:
+        raise NumArgumentError(
+            "Num.Integrate ranges must either all name coordinate symbols or "
+            "all omit them."
+        )
+
+    if explicit_symbols:
+        return explicit_symbols
+
+    symbolic_symbols = sorted(
+        _free_symbols(function) | _free_symbols(domain_func),
+        key=lambda symbol: symbol.name,
+    )
+    if not symbolic_symbols:
+        return None
+    if len(symbolic_symbols) != len(rectangle.symbols):
+        raise NumArgumentError(
+            "Symbolic Num.Integrate inputs need one coordinate symbol per "
+            "range, such as [(x, -1, 1), (y, -1, 1)]."
+        )
+    return tuple(symbolic_symbols)
+
+
+def _cubature_callback(
+    function: object,
+    *,
+    domain_func: object | None,
+    coordinate_symbols: tuple[sympy.Symbol, ...] | None,
+    args: tuple[object, ...],
+) -> Callable[[np.ndarray], np.ndarray]:
+    """Return a SciPy cubature callback with sample-first output shape."""
+
+    symbolic_domain = _is_symbolic(domain_func)
+    if coordinate_symbols is not None and _is_symbolic(function):
+        function = _compile_symbolic_integrand(
+            function,
+            domain_func=domain_func,
+            coordinate_symbols=coordinate_symbols,
+        )
+        if symbolic_domain:
+            domain_func = None
+    elif coordinate_symbols is not None and _is_symbolic(domain_func):
+        domain_func = compile_num(domain_func, args=coordinate_symbols)
+
+    if not callable(function):
+        constant = sympy.sympify(function)
+        if coordinate_symbols is None:
+            function = lambda *unused_args: constant
+        else:
+            function = compile_num(constant, args=coordinate_symbols)
+
+    if domain_func is not None and not callable(domain_func):
+        domain_func = sympy.sympify(domain_func)
+        if coordinate_symbols is None:
+            constant_domain = domain_func
+            domain_func = lambda *unused_args: constant_domain
+        else:
+            domain_func = compile_num(domain_func, args=coordinate_symbols)
+
+    def callback(points: np.ndarray) -> np.ndarray:
+        values = _evaluate_vectorized(function, points, args)
+        if domain_func is None:
+            return values
+
+        domain_values = _evaluate_vectorized(domain_func, points, args)
+        mask = np.asarray(domain_values) < 0
+        while mask.ndim < values.ndim:
+            mask = mask[..., np.newaxis]
+        return np.where(mask, values, 0)
+
+    return callback
+
+
+def _compile_symbolic_integrand(
+    function: object,
+    *,
+    domain_func: object | None,
+    coordinate_symbols: tuple[sympy.Symbol, ...],
+) -> NumFunction:
+    """Compile a symbolic integrand, including a symbolic domain mask when possible."""
+
+    expression = function
+    if domain_func is not None and _is_symbolic(domain_func):
+        indicator = If(sympy.sympify(domain_func) < 0).Then(1).Otherwise(0)
+        expression = sympy.sympify(function) * indicator
+    return compile_num(expression, args=coordinate_symbols)
+
+
+def _evaluate_vectorized(
+    function: Callable[..., object],
+    points: np.ndarray,
+    args: tuple[object, ...],
+) -> np.ndarray:
+    """Evaluate a vectorized callable using one coordinate array per dimension."""
+
+    coordinate_columns = tuple(points[:, axis] for axis in range(points.shape[1]))
+    values = function(*coordinate_columns, *args)
+    return _sample_first_array(values, points.shape[0])
+
+
+def _sample_first_array(value: object, sample_count: int) -> np.ndarray:
+    """Return an array whose leading axis has one entry per cubature sample."""
+
+    array = np.asarray(value)
+    if array.shape == ():
+        return np.full((sample_count,), array)
+    if array.shape[0] == sample_count:
+        return array
+    return np.broadcast_to(array, (sample_count,) + array.shape)
+
+
+def _is_symbolic(value: object) -> bool:
+    """Return whether ``value`` is a symbolic expression accepted by ``Num``."""
+
+    return isinstance(value, sympy.Basic | sympy.MatrixBase)
+
+
+def _free_symbols(value: object | None) -> set[sympy.Symbol]:
+    """Return free symbols from symbolic inputs only."""
+
+    if value is None or callable(value):
+        return set()
+    if isinstance(value, sympy.MatrixBase):
+        symbols: set[sympy.Symbol] = set()
+        for entry in value:
+            symbols.update(entry.free_symbols)
+        return symbols
+    if isinstance(value, sympy.Basic):
+        return set(value.free_symbols)
+    return set()
+
+
+
+================================================
+FILE: ivp.py
+================================================
+"""Represent and solve first-order initial value problems."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import ClassVar
+
+import numpy as np
+from scipy.integrate import solve_ivp as scipy_solve_ivp
+import sympy
+
+from ..sympy_extensions.vector_equations import VectorEquation2SystemOfEquations
+from .compile import compile_num
+from .errors import NumArgumentError, NumSolverError
+from .functions import ImplementedFunction
+
+
+@dataclass(frozen=True)
+class _NormalizedIVP:
+    """Store a validated first-order IVP system."""
+
+    raw_input: object
+    numeric_rhs: Callable[[object, object, object], object] | None
+    rhs_entries: tuple[object, ...]
+    rhs_function: object | None
+    unknowns: tuple[object, ...]
+    component_keys: tuple[object, ...]
+    state_symbols: tuple[sympy.Symbol, ...]
+    domain: tuple[sympy.Symbol, object, object]
+    initial_values: tuple[object, ...]
+    initial_data: dict[object, object]
+    parameters: tuple[sympy.Symbol, ...]
+    free_symbols: frozenset[sympy.Symbol]
+    selection_mode: str
+
+
+@dataclass(frozen=True)
+class _SolverOptions:
+    """Store public SciPy IVP solver options."""
+
+    samples: int | None
+    method: str
+    rtol: float
+    atol: float
+    max_step: float
+
+
+@dataclass(frozen=True)
+class _IVPSolveData:
+    """Store one concrete IVP solver run."""
+
+    sample_points: np.ndarray
+    sample_values: np.ndarray
+    dense_solution: Callable[[object], object]
+    parameter_values: dict[sympy.Symbol, object]
+    raw_result: object
+
+
+@dataclass(frozen=True, init=False)
+class IVP:
+    """Represent a symbolic first-order initial value problem.
+
+    Parameters
+    ----------
+    equations_or_rhs : object
+        RHS array, array of pure first-derivative equations, vector equation,
+        or numeric callback with signature ``rhs(t_value, state_vector, params)``.
+    unknowns : sequence, optional
+        State labels for RHS-array and numeric-callback input.
+    domain : tuple
+        Independent-variable interval ``(variable, start, stop)``.
+    initial_data : mapping
+        Initial values keyed by state labels or by applied functions at the
+        start of the domain.
+    parameters : sequence, optional
+        Explicit parameter symbols for numeric callbacks or symbolic problems.
+
+    Methods
+    -------
+    subs
+        Return a specialized symbolic IVP.
+    xreplace
+        Return an exactly replaced symbolic IVP.
+    explain
+        Return a short human-readable problem summary.
+    """
+
+    equations_or_rhs: object
+    unknowns: tuple[object, ...]
+    domain: tuple[sympy.Symbol, object, object]
+    initial_data: dict[object, object]
+    parameters: tuple[sympy.Symbol, ...]
+    options: Mapping[str, object]
+    _system: _NormalizedIVP
+    _unknowns_argument: tuple[object, ...] | None
+    _explicit_parameters: tuple[sympy.Symbol, ...]
+    _parameters_were_explicit: bool
+    _solver: ClassVar[object]
+
+    def __init__(
+        self,
+        equations_or_rhs: object,
+        *,
+        unknowns: Sequence[object] | None = None,
+        domain: object,
+        initial_data: Mapping[object, object],
+        parameters: Sequence[object] = (),
+        **options: object,
+    ) -> None:
+        """Create an unevaluated symbolic IVP problem."""
+
+        unknowns_argument = None if unknowns is None else tuple(unknowns)
+        explicit_parameters = _normalize_parameters(parameters)
+        system = _normalize_ivp_system(
+            equations_or_rhs,
+            unknowns=unknowns_argument,
+            domain=domain,
+            initial_data=initial_data,
+            explicit_parameters=explicit_parameters,
+        )
+
+        object.__setattr__(self, "equations_or_rhs", equations_or_rhs)
+        object.__setattr__(self, "unknowns", system.unknowns)
+        object.__setattr__(self, "domain", system.domain)
+        object.__setattr__(self, "initial_data", system.initial_data)
+        object.__setattr__(self, "parameters", system.parameters)
+        object.__setattr__(self, "options", dict(options))
+        object.__setattr__(self, "_system", system)
+        object.__setattr__(self, "_unknowns_argument", unknowns_argument)
+        object.__setattr__(self, "_explicit_parameters", explicit_parameters)
+        object.__setattr__(self, "_parameters_were_explicit", bool(parameters))
+
+    @property
+    def num_role(self) -> str:
+        """Return the symbolic/numeric boundary role name."""
+
+        return "symbolic-problem"
+
+    @property
+    def kind(self) -> str:
+        """Return the mathematical problem kind."""
+
+        return "ivp"
+
+    @property
+    def free_symbols(self) -> frozenset[sympy.Symbol]:
+        """Return unresolved symbols that parameterize the problem."""
+
+        return self._system.free_symbols
+
+    @property
+    def independent_variables(self) -> tuple[sympy.Symbol, ...]:
+        """Return the independent variables of this IVP."""
+
+        return (self.domain[0],)
+
+    @property
+    def diagnostics(self) -> tuple[object, ...]:
+        """Return problem diagnostics collected during construction."""
+
+        return ()
+
+    def subs(self, *args: object, **kwargs: object) -> "IVP":
+        """Return a specialized IVP after ordinary SymPy substitution."""
+
+        raw_input = _subs_value(self.equations_or_rhs, *args, **kwargs)
+        domain = tuple(_subs_value(part, *args, **kwargs) for part in self.domain)
+        initial_data = {
+            _subs_value(key, *args, **kwargs): _subs_value(value, *args, **kwargs)
+            for key, value in self.initial_data.items()
+        }
+        unknowns = (
+            None
+            if self._unknowns_argument is None
+            else tuple(_subs_value(value, *args, **kwargs) for value in self._unknowns_argument)
+        )
+        parameters = _remaining_explicit_parameters(
+            self._explicit_parameters,
+            self._parameters_were_explicit,
+            *args,
+            **kwargs,
+        )
+        return IVP(
+            raw_input,
+            unknowns=unknowns,
+            domain=domain,
+            initial_data=initial_data,
+            parameters=parameters,
+            **dict(self.options),
+        )
+
+    def xreplace(self, rule: Mapping[object, object]) -> "IVP":
+        """Return an IVP after exact SymPy replacement."""
+
+        raw_input = _xreplace_value(self.equations_or_rhs, rule)
+        domain = tuple(_xreplace_value(part, rule) for part in self.domain)
+        initial_data = {
+            _xreplace_value(key, rule): _xreplace_value(value, rule)
+            for key, value in self.initial_data.items()
+        }
+        unknowns = (
+            None
+            if self._unknowns_argument is None
+            else tuple(_xreplace_value(value, rule) for value in self._unknowns_argument)
+        )
+        parameters = (
+            tuple(_xreplace_value(parameter, rule) for parameter in self._explicit_parameters)
+            if self._parameters_were_explicit
+            else ()
+        )
+        parameters = tuple(parameter for parameter in parameters if isinstance(parameter, sympy.Symbol))
+        return IVP(
+            raw_input,
+            unknowns=unknowns,
+            domain=domain,
+            initial_data=initial_data,
+            parameters=parameters,
+            **dict(self.options),
+        )
+
+    def explain(self) -> str:
+        """Return a short explanation of the symbolic IVP."""
+
+        return (
+            f"num_role: {self.num_role}\n"
+            f"kind: {self.kind}\n"
+            f"unknowns: {self.unknowns}\n"
+            f"domain: {self.domain}\n"
+            f"parameters: {self.parameters}"
+        )
+
+    def __repr__(self) -> str:
+        """Return a concise problem representation."""
+
+        return (
+            "IVP("
+            f"unknowns={self.unknowns!r}, "
+            f"domain={self.domain!r}, "
+            f"parameters={self.parameters!r}"
+            ")"
+        )
+
+    def _latex(self, printer: object) -> str:
+        """Return a mathematical LaTeX representation of the IVP."""
+
+        lines = [
+            *_ivp_equation_latex_lines(self, printer),
+            *_ivp_initial_latex_lines(self, printer),
+        ]
+        body = r" \\ ".join(lines)
+        domain = _ivp_domain_latex_line(self, printer)
+        return (
+            r"\left\{\begin{array}{l}"
+            f"{body}"
+            rf"\end{{array}}\right.\quad {domain}"
+        )
+
+    def _repr_latex_(self) -> str:
+        """Return the notebook LaTeX display payload for this IVP."""
+
+        return f"$${sympy.latex(self)}$$"
+
+    def _rhs_value(
+        self,
+        t_value: object,
+        state_vector: np.ndarray,
+        parameter_values: Mapping[sympy.Symbol, object],
+    ) -> np.ndarray:
+        """Evaluate the normalized RHS vector at one solver point."""
+
+        if self._system.numeric_rhs is not None:
+            params = _callback_parameter_dict(parameter_values)
+            values = self._system.numeric_rhs(t_value, state_vector, params)
+        else:
+            if self._system.rhs_function is None:
+                raise NumSolverError("IVP has no RHS function to evaluate.")
+            arguments = (
+                t_value,
+                *tuple(state_vector),
+                *tuple(parameter_values[parameter] for parameter in self.parameters),
+            )
+            values = self._system.rhs_function(*arguments)
+
+        array = np.asarray(values, dtype=float).reshape(-1)
+        if array.shape != (len(self.unknowns),):
+            raise NumSolverError(
+                "IVP RHS returned a vector of length "
+                f"{array.shape[0]}, expected {len(self.unknowns)}."
+            )
+        return array
+
+
+class IVPSolution:
+    """Represent a Python container of IVP solution branches."""
+
+    def __init__(self, branches: Sequence["IVPSolutionBranch"]) -> None:
+        self._branches = tuple(branches)
+
+    @property
+    def diagnostics(self) -> tuple[object, ...]:
+        """Return diagnostics attached to solution branches."""
+
+        diagnostics: list[object] = []
+        for branch in self._branches:
+            diagnostics.extend(branch.diagnostics)
+        return tuple(diagnostics)
+
+    def __getitem__(self, index: int) -> "IVPSolutionBranch":
+        """Return one solution branch by position."""
+
+        return self._branches[index]
+
+    def __len__(self) -> int:
+        """Return the number of solution branches."""
+
+        return len(self._branches)
+
+    def __iter__(self) -> object:
+        """Iterate over solution branches."""
+
+        return iter(self._branches)
+
+    def explain(self) -> str:
+        """Return a short explanation of the solution container."""
+
+        return f"IVPSolution with {len(self)} branch(es)."
+
+    def __repr__(self) -> str:
+        """Return a concise solution representation."""
+
+        return f"IVPSolution(branches={len(self)})"
+
+
+class IVPSolutionBranch:
+    """Represent one implemented symbolic IVP solution branch."""
+
+    def __init__(
+        self,
+        ivp: IVP,
+        options: _SolverOptions,
+        *,
+        data: _IVPSolveData | None = None,
+    ) -> None:
+        self.ivp = ivp
+        self.options = options
+        self.symbolic_origin = ivp
+        self.required_parameters = ivp.parameters
+        self.independent_variables = ivp.independent_variables
+        self.domain = ivp.domain
+        self.output_shape = (len(ivp.unknowns),)
+        self.backend = "scipy.integrate.solve_ivp"
+        self.discretization = {
+            "samples": options.samples,
+            "method": options.method,
+        }
+        self.diagnostics: tuple[object, ...] = ()
+        self.cache_label = f"ivp:{id(self):x}"
+        self._data = data
+        self._cache: dict[tuple[object, ...], _IVPSolveData] = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        # Components are symbolic function heads; numerical evaluation remains
+        # behind Num so composed expressions share the same boundary contract.
+        self._components: dict[object, ImplementedFunction] = {}
+        for index, key in enumerate(ivp._system.component_keys):
+            self._components[key] = ImplementedFunction(
+                display_name=_component_display_name(key),
+                branch=self,
+                component_key=key,
+                component_index=index,
+            )
+
+    @property
+    def num_role(self) -> str:
+        """Return the symbolic/numeric boundary role name."""
+
+        return "implemented-solution"
+
+    @property
+    def implementation_status(self) -> str:
+        """Return whether this branch is concrete or parameterized."""
+
+        return "parameterized" if self.required_parameters else "ready"
+
+    @property
+    def sample_points(self) -> np.ndarray | None:
+        """Return stored sample points when a concrete solve is available."""
+
+        data = self._data
+        return None if data is None else data.sample_points
+
+    @property
+    def sample_values(self) -> np.ndarray | None:
+        """Return stored sample values when a concrete solve is available."""
+
+        data = self._data
+        return None if data is None else data.sample_values
+
+    def __getitem__(self, key: object) -> ImplementedFunction:
+        """Return an implemented component function by label or position."""
+
+        try:
+            return self._components[key]
+        except KeyError as exc:
+            raise KeyError(f"IVP solution has no component {key!r}.") from exc
+
+    def evaluate_component(
+        self,
+        component_index: int,
+        t_values: object,
+        parameter_values: Mapping[sympy.Symbol, object],
+    ) -> object:
+        """Evaluate one component over scalar or array sample points."""
+
+        data = self._data_for(parameter_values)
+        sample_array = np.asarray(t_values, dtype=float)
+        scalar_input = sample_array.shape == ()
+        flat_times = sample_array.reshape(-1) if not scalar_input else sample_array.reshape(1)
+
+        values = np.asarray(data.dense_solution(flat_times), dtype=float)
+        component_values = values[component_index].reshape(flat_times.shape)
+        if scalar_input:
+            return component_values[0].item()
+        return component_values.reshape(sample_array.shape)
+
+    def subs(self, *args: object, **kwargs: object) -> "IVPSolutionBranch":
+        """Return this branch after symbolic substitution."""
+
+        return _make_branch(self.ivp.subs(*args, **kwargs), self.options)
+
+    def xreplace(self, rule: Mapping[object, object]) -> "IVPSolutionBranch":
+        """Return this branch after exact symbolic replacement."""
+
+        return _make_branch(self.ivp.xreplace(rule), self.options)
+
+    def cache_info(self) -> dict[str, object]:
+        """Return public information about cached parameterized solves."""
+
+        return {
+            "size": len(self._cache),
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "parameters": tuple(parameter.name for parameter in self.required_parameters),
+        }
+
+    def clear_cache(self) -> None:
+        """Clear cached parameterized solver results."""
+
+        self._cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def explain(self) -> str:
+        """Return a short explanation of this implemented solution branch."""
+
+        return (
+            f"num_role: {self.num_role}\n"
+            f"implementation_status: {self.implementation_status}\n"
+            f"domain: {self.domain}\n"
+            f"required_parameters: {self.required_parameters}"
+        )
+
+    def _data_for(
+        self,
+        parameter_values: Mapping[sympy.Symbol, object],
+    ) -> _IVPSolveData:
+        """Return concrete solver data for a parameter tuple."""
+
+        if not self.required_parameters:
+            if self._data is None:
+                self._data = _solve_concrete_ivp(self.ivp, self.options, {})
+            return self._data
+
+        key = tuple(parameter_values[parameter] for parameter in self.required_parameters)
+        if key in self._cache:
+            self._cache_hits += 1
+            return self._cache[key]
+
+        self._cache_misses += 1
+        data = _solve_concrete_ivp(self.ivp, self.options, parameter_values)
+        self._cache[key] = data
+        return data
+
+
+def SolveIVP(
+    problem_or_rhs: object,
+    *,
+    samples: int | None = None,
+    method: str = "RK45",
+    rtol: float = 1e-6,
+    atol: float = 1e-9,
+    max_step: float = np.inf,
+    **ivp_kwargs: object,
+) -> IVPSolution:
+    """Solve an IVP problem or construct one from public IVP arguments.
+
+    Parameters
+    ----------
+    problem_or_rhs : object
+        Existing ``IVP`` problem, or the first argument used to construct one.
+    samples : int, optional
+        Number of evenly spaced stored samples including both endpoints.
+    method : str, optional
+        SciPy ``solve_ivp`` method.
+    rtol : float, optional
+        Relative solver tolerance.
+    atol : float, optional
+        Absolute solver tolerance.
+    max_step : float, optional
+        Maximum solver step passed to SciPy.
+    **ivp_kwargs : object
+        Constructor keywords used only by the convenience form.
+
+    Returns
+    -------
+    IVPSolution
+        Python solution container with one implemented solution branch.
+    """
+
+    options = _solver_options(
+        samples=samples,
+        method=method,
+        rtol=rtol,
+        atol=atol,
+        max_step=max_step,
+    )
+    if isinstance(problem_or_rhs, IVP):
+        if ivp_kwargs:
+            unknown = ", ".join(sorted(ivp_kwargs))
+            raise NumArgumentError(
+                "SolveIVP received IVP constructor keyword(s) for an existing "
+                f"problem: {unknown}."
+            )
+        branch = _make_branch(problem_or_rhs, options)
+        return IVPSolution([branch])
+
+    from .solve import Solve
+
+    problem = IVP(problem_or_rhs, **ivp_kwargs)
+    return Solve(
+        problem,
+        samples=samples,
+        method=method,
+        rtol=rtol,
+        atol=atol,
+        max_step=max_step,
+    )
+
+
+def _make_branch(ivp: IVP, options: _SolverOptions) -> IVPSolutionBranch:
+    """Return a branch, solving immediately when the problem is concrete."""
+
+    data = None
+    if not ivp.parameters:
+        data = _solve_concrete_ivp(ivp, options, {})
+    return IVPSolutionBranch(ivp, options, data=data)
+
+
+def _normalize_ivp_system(
+    equations_or_rhs: object,
+    *,
+    unknowns: tuple[object, ...] | None,
+    domain: object,
+    initial_data: Mapping[object, object],
+    explicit_parameters: tuple[sympy.Symbol, ...],
+) -> _NormalizedIVP:
+    """Return a normalized first-order IVP system."""
+
+    domain_tuple = _normalize_domain(domain)
+    if not isinstance(initial_data, Mapping):
+        raise NumArgumentError("IVP initial_data must be a mapping.")
+
+    if _is_numeric_rhs(equations_or_rhs):
+        return _normalize_numeric_rhs(
+            equations_or_rhs,
+            unknowns=unknowns,
+            domain=domain_tuple,
+            initial_data=initial_data,
+            explicit_parameters=explicit_parameters,
+        )
+
+    vector_equation = _vector_equation_or_none(equations_or_rhs)
+    if vector_equation is not None:
+        equations = VectorEquation2SystemOfEquations(vector_equation)
+        return _normalize_equation_system(
+            equations,
+            domain=domain_tuple,
+            initial_data=initial_data,
+            explicit_parameters=explicit_parameters,
+            selection_mode="position",
+        )
+
+    equations = _equation_sequence_or_none(equations_or_rhs)
+    if equations is not None:
+        return _normalize_equation_system(
+            equations,
+            domain=domain_tuple,
+            initial_data=initial_data,
+            explicit_parameters=explicit_parameters,
+            selection_mode="label",
+        )
+
+    return _normalize_rhs_array(
+        equations_or_rhs,
+        unknowns=unknowns,
+        domain=domain_tuple,
+        initial_data=initial_data,
+        explicit_parameters=explicit_parameters,
+    )
+
+
+def _normalize_rhs_array(
+    rhs: object,
+    *,
+    unknowns: tuple[object, ...] | None,
+    domain: tuple[sympy.Symbol, object, object],
+    initial_data: Mapping[object, object],
+    explicit_parameters: tuple[sympy.Symbol, ...],
+) -> _NormalizedIVP:
+    """Normalize RHS-array input with explicit state ordering."""
+
+    if unknowns is None:
+        raise NumArgumentError("IVP RHS-array input requires unknowns.")
+    unknown_tuple = _normalize_unknowns(unknowns)
+    rhs_entries = _rhs_entries(rhs)
+    if len(rhs_entries) != len(unknown_tuple):
+        raise NumArgumentError(
+            "IVP RHS array length does not match unknowns: "
+            f"{len(rhs_entries)} RHS entries for {len(unknown_tuple)} unknowns."
+        )
+
+    state_symbols = _state_symbols(len(unknown_tuple))
+    replacements = {
+        unknown: state_symbol
+        for unknown, state_symbol in zip(unknown_tuple, state_symbols)
+        if isinstance(unknown, sympy.Basic)
+    }
+    normalized_rhs = tuple(sympy.sympify(entry).xreplace(replacements) for entry in rhs_entries)
+    initial_values = tuple(
+        _initial_value_for_unknown(unknown, initial_data, domain[1])
+        for unknown in unknown_tuple
+    )
+    normalized_initial_data = dict(zip(unknown_tuple, initial_values))
+    parameters = _problem_parameters(
+        explicit_parameters,
+        rhs_entries=rhs_entries,
+        unknowns=unknown_tuple,
+        domain=domain,
+        initial_values=initial_values,
+    )
+    rhs_function = compile_num(
+        sympy.Matrix(normalized_rhs),
+        args=(domain[0], *state_symbols, *parameters),
+    )
+    free_symbols = _problem_free_symbols(
+        rhs_entries=rhs_entries,
+        unknowns=unknown_tuple,
+        domain=domain,
+        initial_values=initial_values,
+        parameters=parameters,
+    )
+    return _NormalizedIVP(
+        raw_input=rhs,
+        numeric_rhs=None,
+        rhs_entries=normalized_rhs,
+        rhs_function=rhs_function,
+        unknowns=unknown_tuple,
+        component_keys=unknown_tuple,
+        state_symbols=state_symbols,
+        domain=domain,
+        initial_values=initial_values,
+        initial_data=normalized_initial_data,
+        parameters=parameters,
+        free_symbols=free_symbols,
+        selection_mode="label",
+    )
+
+
+def _normalize_equation_system(
+    equations: Sequence[sympy.Equality],
+    *,
+    domain: tuple[sympy.Symbol, object, object],
+    initial_data: Mapping[object, object],
+    explicit_parameters: tuple[sympy.Symbol, ...],
+    selection_mode: str,
+) -> _NormalizedIVP:
+    """Normalize pure first-derivative equation input."""
+
+    if not equations:
+        raise NumArgumentError("IVP equation input requires at least one equation.")
+
+    derivative_data = [
+        _pure_derivative_equation(equation, domain[0])
+        for equation in equations
+    ]
+    unknowns = tuple(label for label, _, _ in derivative_data)
+    applied_unknowns = tuple(applied for _, applied, _ in derivative_data)
+    rhs_entries = tuple(rhs for _, _, rhs in derivative_data)
+    state_symbols = _state_symbols(len(unknowns))
+    replacements = dict(zip(applied_unknowns, state_symbols))
+    normalized_rhs = tuple(sympy.sympify(rhs).xreplace(replacements) for rhs in rhs_entries)
+    initial_values = tuple(
+        _initial_value_for_unknown(unknown, initial_data, domain[1])
+        for unknown in unknowns
+    )
+    normalized_initial_data = dict(zip(unknowns, initial_values))
+    parameters = _problem_parameters(
+        explicit_parameters,
+        rhs_entries=rhs_entries,
+        unknowns=(),
+        domain=domain,
+        initial_values=initial_values,
+    )
+    rhs_function = compile_num(
+        sympy.Matrix(normalized_rhs),
+        args=(domain[0], *state_symbols, *parameters),
+    )
+    component_keys: tuple[object, ...]
+    if selection_mode == "position":
+        component_keys = tuple(range(len(unknowns)))
+    else:
+        component_keys = unknowns
+    free_symbols = _problem_free_symbols(
+        rhs_entries=rhs_entries,
+        unknowns=(),
+        domain=domain,
+        initial_values=initial_values,
+        parameters=parameters,
+    )
+    return _NormalizedIVP(
+        raw_input=tuple(equations),
+        numeric_rhs=None,
+        rhs_entries=normalized_rhs,
+        rhs_function=rhs_function,
+        unknowns=unknowns,
+        component_keys=component_keys,
+        state_symbols=state_symbols,
+        domain=domain,
+        initial_values=initial_values,
+        initial_data=normalized_initial_data,
+        parameters=parameters,
+        free_symbols=free_symbols,
+        selection_mode=selection_mode,
+    )
+
+
+def _normalize_numeric_rhs(
+    rhs: object,
+    *,
+    unknowns: tuple[object, ...] | None,
+    domain: tuple[sympy.Symbol, object, object],
+    initial_data: Mapping[object, object],
+    explicit_parameters: tuple[sympy.Symbol, ...],
+) -> _NormalizedIVP:
+    """Normalize an already numeric RHS callback."""
+
+    if unknowns is None:
+        raise NumArgumentError("Numeric IVP RHS input requires unknowns.")
+    unknown_tuple = _normalize_unknowns(unknowns)
+    initial_values = tuple(
+        _initial_value_for_unknown(unknown, initial_data, domain[1])
+        for unknown in unknown_tuple
+    )
+    normalized_initial_data = dict(zip(unknown_tuple, initial_values))
+    free_symbols = _problem_free_symbols(
+        rhs_entries=(),
+        unknowns=unknown_tuple,
+        domain=domain,
+        initial_values=initial_values,
+        parameters=explicit_parameters,
+    )
+    return _NormalizedIVP(
+        raw_input=rhs,
+        numeric_rhs=rhs,
+        rhs_entries=(),
+        rhs_function=None,
+        unknowns=unknown_tuple,
+        component_keys=unknown_tuple,
+        state_symbols=_state_symbols(len(unknown_tuple)),
+        domain=domain,
+        initial_values=initial_values,
+        initial_data=normalized_initial_data,
+        parameters=explicit_parameters,
+        free_symbols=free_symbols,
+        selection_mode="label",
+    )
+
+
+def _solve_concrete_ivp(
+    ivp: IVP,
+    options: _SolverOptions,
+    parameter_values: Mapping[sympy.Symbol, object],
+) -> _IVPSolveData:
+    """Run SciPy for one concrete IVP parameter tuple."""
+
+    concrete_parameters = {
+        parameter: parameter_values[parameter]
+        for parameter in ivp.parameters
+    }
+    start = _numeric_scalar(ivp.domain[1], concrete_parameters, "domain start")
+    stop = _numeric_scalar(ivp.domain[2], concrete_parameters, "domain stop")
+    initial_values = np.asarray(
+        [
+            _numeric_scalar(value, concrete_parameters, "initial data")
+            for value in ivp._system.initial_values
+        ],
+        dtype=float,
+    )
+    t_eval = None
+    if options.samples is not None:
+        t_eval = np.linspace(start, stop, options.samples)
+
+    def rhs_callback(t_value: float, state_vector: np.ndarray) -> np.ndarray:
+        return ivp._rhs_value(t_value, state_vector, concrete_parameters)
+
+    result = scipy_solve_ivp(
+        rhs_callback,
+        (start, stop),
+        initial_values,
+        method=options.method,
+        t_eval=t_eval,
+        dense_output=True,
+        rtol=options.rtol,
+        atol=options.atol,
+        max_step=options.max_step,
+    )
+    if not result.success:
+        raise NumSolverError(f"IVP solver failed: {result.message}")
+    if result.sol is None:
+        raise NumSolverError("IVP solver did not return dense output.")
+
+    return _IVPSolveData(
+        sample_points=np.asarray(result.t, dtype=float),
+        sample_values=np.asarray(result.y, dtype=float),
+        dense_solution=result.sol,
+        parameter_values=dict(concrete_parameters),
+        raw_result=result,
+    )
+
+
+def _solver_options(
+    *,
+    samples: int | None,
+    method: str,
+    rtol: float,
+    atol: float,
+    max_step: float,
+) -> _SolverOptions:
+    """Validate and store public solver options."""
+
+    if samples is not None:
+        if not isinstance(samples, int) or isinstance(samples, bool):
+            raise NumArgumentError("SolveIVP samples must be an integer.")
+        if samples < 2:
+            raise NumArgumentError("SolveIVP samples must be at least 2.")
+    return _SolverOptions(
+        samples=samples,
+        method=method,
+        rtol=float(rtol),
+        atol=float(atol),
+        max_step=float(max_step),
+    )
+
+
+def _normalize_domain(domain: object) -> tuple[sympy.Symbol, object, object]:
+    """Return ``(variable, start, stop)`` after checking the public domain."""
+
+    if not _is_sequence(domain) or len(domain) != 3:
+        raise NumArgumentError("IVP domain must be (variable, start, stop).")
+    variable, start, stop = domain
+    if not isinstance(variable, sympy.Symbol):
+        raise NumArgumentError("IVP domain variable must be a SymPy Symbol.")
+    return variable, start, stop
+
+
+def _ivp_equation_latex_lines(ivp: IVP, printer: object) -> tuple[str, ...]:
+    """Return LaTeX equation lines for an IVP display."""
+
+    raw_input = ivp.equations_or_rhs
+    if ivp._system.numeric_rhs is not None:
+        variable = _latex_print(ivp.domain[0], printer)
+        state = _latex_print(sympy.Matrix(ivp.unknowns), printer)
+        return (rf"\frac{{d}}{{d {variable}}}{state} = \operatorname{{rhs}}",)
+
+    vector_equation = _vector_equation_or_none(raw_input)
+    if vector_equation is not None:
+        return (_latex_print(vector_equation, printer),)
+
+    equations = _equation_sequence_or_none(raw_input)
+    if equations is not None:
+        return tuple(_latex_print(equation, printer) for equation in equations)
+
+    variable = _latex_print(ivp.domain[0], printer)
+    state_entries = [
+        _state_display_for_unknown(unknown, ivp.domain[0])
+        for unknown in ivp.unknowns
+    ]
+    display_replacements = {
+        unknown: state_entry
+        for unknown, state_entry in zip(ivp.unknowns, state_entries)
+        if isinstance(unknown, sympy.Basic)
+    }
+    rhs_entries = tuple(
+        _xreplace_value(entry, display_replacements)
+        for entry in _rhs_entries(raw_input)
+    )
+    state = _latex_print(sympy.Matrix(state_entries), printer)
+    rhs = _latex_print(sympy.Matrix(rhs_entries), printer)
+    return (rf"\frac{{d}}{{d {variable}}}{state} = {rhs}",)
+
+
+def _ivp_initial_latex_lines(ivp: IVP, printer: object) -> tuple[str, ...]:
+    """Return LaTeX initial-condition lines for an IVP display."""
+
+    start = ivp.domain[1]
+    if _ivp_uses_vector_initial_latex(ivp):
+        left_entries = [
+            _initial_display_for_unknown(unknown, start)
+            for unknown in ivp.unknowns
+        ]
+        left = _latex_print(sympy.Matrix(left_entries), printer)
+        right = _latex_print(sympy.Matrix(ivp._system.initial_values), printer)
+        return (f"{left} = {right}",)
+
+    return tuple(
+        (
+            f"{_latex_print(_initial_display_for_unknown(unknown, start), printer)}"
+            f" = {_latex_print(value, printer)}"
+        )
+        for unknown, value in zip(ivp.unknowns, ivp._system.initial_values)
+    )
+
+
+def _ivp_uses_vector_initial_latex(ivp: IVP) -> bool:
+    """Return whether initial data should render as one vector equation."""
+
+    raw_input = ivp.equations_or_rhs
+    if _vector_equation_or_none(raw_input) is not None:
+        return True
+    if _equation_sequence_or_none(raw_input) is not None:
+        return False
+    return len(ivp.unknowns) > 1
+
+
+def _ivp_domain_latex_line(ivp: IVP, printer: object) -> str:
+    """Return the LaTeX domain line for an IVP display."""
+
+    variable, start, stop = ivp.domain
+    return (
+        f"{_latex_print(variable, printer)} \\in "
+        rf"\left[{_latex_print(start, printer)}, {_latex_print(stop, printer)}\right]"
+    )
+
+
+def _state_display_for_unknown(unknown: object, variable: object) -> object:
+    """Return a display expression for one unknown state component."""
+
+    if isinstance(unknown, sympy.Symbol):
+        return sympy.Function(unknown.name)(variable)
+    try:
+        applied = unknown(variable)
+    except TypeError:
+        return unknown
+    return applied
+
+
+def _initial_display_for_unknown(unknown: object, start: object) -> object:
+    """Return a display expression for one initial condition target."""
+
+    if isinstance(unknown, sympy.Symbol):
+        return sympy.Function(unknown.name)(start)
+    try:
+        applied = unknown(start)
+    except TypeError:
+        return unknown
+    return applied
+
+
+def _latex_print(value: object, printer: object) -> str:
+    """Return a LaTeX fragment through SymPy's active printer."""
+
+    print_method = getattr(printer, "_print", None)
+    if callable(print_method):
+        return print_method(value)
+    return sympy.latex(value)
+
+
+def _normalize_unknowns(unknowns: Sequence[object]) -> tuple[object, ...]:
+    """Return a concrete unknown tuple after public validation."""
+
+    if not _is_sequence(unknowns):
+        raise NumArgumentError("IVP unknowns must be a sequence.")
+    normalized = tuple(unknowns)
+    if not normalized:
+        raise NumArgumentError("IVP unknowns must not be empty.")
+    return normalized
+
+
+def _normalize_parameters(parameters: Sequence[object]) -> tuple[sympy.Symbol, ...]:
+    """Return explicit parameter symbols in deterministic order."""
+
+    if parameters is None:
+        return ()
+    if not _is_sequence(parameters):
+        raise NumArgumentError("IVP parameters must be a sequence of symbols.")
+    normalized: list[sympy.Symbol] = []
+    for parameter in parameters:
+        if not isinstance(parameter, sympy.Symbol):
+            raise NumArgumentError("IVP parameters must be SymPy symbols.")
+        normalized.append(parameter)
+    return tuple(dict.fromkeys(normalized))
+
+
+def _rhs_entries(rhs: object) -> tuple[object, ...]:
+    """Return vector RHS entries from a public RHS-array value."""
+
+    if isinstance(rhs, sympy.MatrixBase):
+        return tuple(rhs[row, col] for row in range(rhs.rows) for col in range(rhs.cols))
+    if _is_sequence(rhs):
+        return tuple(rhs)
+    raise NumArgumentError("IVP RHS-array input must be a sequence or Matrix.")
+
+
+def _equation_sequence_or_none(value: object) -> tuple[sympy.Equality, ...] | None:
+    """Return equation entries when ``value`` is an equation sequence."""
+
+    if isinstance(value, sympy.Equality):
+        if _vector_equation_or_none(value) is None:
+            return (value,)
+        return None
+    if not _is_sequence(value):
+        return None
+    entries = tuple(value)
+    if entries and all(isinstance(entry, sympy.Equality) for entry in entries):
+        return entries
+    return None
+
+
+def _vector_equation_or_none(value: object) -> sympy.Equality | None:
+    """Return a matrix-shaped equality when public input is a vector equation."""
+
+    if not isinstance(value, sympy.Equality):
+        return None
+    if _finite_matrix_shape(value.lhs) is None or _finite_matrix_shape(value.rhs) is None:
+        return None
+    return value
+
+
+def _finite_matrix_shape(value: object) -> tuple[int, int] | None:
+    """Return a finite matrix shape when one is available."""
+
+    shape = getattr(value, "shape", None)
+    if not isinstance(shape, tuple) or len(shape) != 2:
+        return None
+    try:
+        return int(shape[0]), int(shape[1])
+    except TypeError as exc:
+        raise NumArgumentError(
+            f"IVP vector equations require finite matrix shapes, got {shape}."
+        ) from exc
+
+
+def _pure_derivative_equation(
+    equation: sympy.Equality,
+    variable: sympy.Symbol,
+) -> tuple[object, sympy.Function, object]:
+    """Return ``(label, applied_unknown, rhs)`` for a pure derivative equation."""
+
+    lhs = equation.lhs
+    if not isinstance(lhs, sympy.Derivative):
+        raise NumArgumentError(
+            "IVP equation left side must be a pure first derivative."
+        )
+    if lhs.variables != (variable,):
+        raise NumArgumentError(
+            "IVP equation left side must be a pure first derivative with "
+            f"respect to {variable}."
+        )
+    applied = lhs.expr
+    if (
+        not isinstance(applied, sympy.Function)
+        or len(applied.args) != 1
+        or applied.args[0] != variable
+    ):
+        raise NumArgumentError(
+            "IVP equation left side must differentiate one unknown function "
+            f"applied to {variable}."
+        )
+    return applied.func, applied, equation.rhs
+
+
+def _initial_value_for_unknown(
+    unknown: object,
+    initial_data: Mapping[object, object],
+    start: object,
+) -> object:
+    """Return the initial value for one unknown label."""
+
+    if unknown in initial_data:
+        return initial_data[unknown]
+    try:
+        applied_at_start = unknown(start)
+    except TypeError:
+        applied_at_start = None
+    if applied_at_start is not None and applied_at_start in initial_data:
+        return initial_data[applied_at_start]
+    raise NumArgumentError(f"IVP initial data is missing unknown {unknown}.")
+
+
+def _problem_parameters(
+    explicit_parameters: tuple[sympy.Symbol, ...],
+    *,
+    rhs_entries: Sequence[object],
+    unknowns: Sequence[object],
+    domain: tuple[sympy.Symbol, object, object],
+    initial_values: Sequence[object],
+) -> tuple[sympy.Symbol, ...]:
+    """Return explicit or inferred IVP parameters."""
+
+    if explicit_parameters:
+        return explicit_parameters
+    return tuple(
+        sorted(
+            _problem_free_symbols(
+                rhs_entries=rhs_entries,
+                unknowns=unknowns,
+                domain=domain,
+                initial_values=initial_values,
+                parameters=(),
+            ),
+            key=lambda symbol: symbol.name,
+        )
+    )
+
+
+def _problem_free_symbols(
+    *,
+    rhs_entries: Sequence[object],
+    unknowns: Sequence[object],
+    domain: tuple[sympy.Symbol, object, object],
+    initial_values: Sequence[object],
+    parameters: Sequence[sympy.Symbol],
+) -> frozenset[sympy.Symbol]:
+    """Return unresolved problem parameters visible through SymPy."""
+
+    symbols: set[sympy.Symbol] = set(parameters)
+    for value in (*rhs_entries, domain[1], domain[2], *initial_values):
+        symbols.update(_free_symbols(value))
+    symbols.discard(domain[0])
+    for unknown in unknowns:
+        symbols.difference_update(_free_symbols(unknown))
+        if isinstance(unknown, sympy.Symbol):
+            symbols.discard(unknown)
+    return frozenset(symbols)
+
+
+def _free_symbols(value: object) -> set[sympy.Symbol]:
+    """Return free symbols from SymPy-compatible values."""
+
+    if isinstance(value, sympy.MatrixBase):
+        symbols: set[sympy.Symbol] = set()
+        for entry in value:
+            symbols.update(_free_symbols(entry))
+        return symbols
+    if isinstance(value, sympy.Basic):
+        return set(value.free_symbols)
+    try:
+        sympified = sympy.sympify(value)
+    except sympy.SympifyError:
+        return set()
+    if isinstance(sympified, sympy.Basic):
+        return set(sympified.free_symbols)
+    return set()
+
+
+def _state_symbols(count: int) -> tuple[sympy.Symbol, ...]:
+    """Return private state placeholders for RHS compilation."""
+
+    return tuple(sympy.Symbol(f"mt_state_{index}") for index in range(count))
+
+
+def _numeric_scalar(
+    value: object,
+    parameter_values: Mapping[sympy.Symbol, object],
+    description: str,
+) -> float:
+    """Return a concrete float after substituting parameter values."""
+
+    concrete = value
+    if isinstance(concrete, sympy.Basic):
+        concrete = concrete.subs(parameter_values)
+        if concrete.free_symbols:
+            joined = ", ".join(symbol.name for symbol in sorted(concrete.free_symbols, key=lambda item: item.name))
+            raise NumArgumentError(
+                f"IVP {description} still depends on unresolved parameter(s): {joined}."
+            )
+    try:
+        return float(concrete)
+    except (TypeError, ValueError) as exc:
+        raise NumArgumentError(f"IVP {description} must be numeric.") from exc
+
+
+def _is_numeric_rhs(value: object) -> bool:
+    """Return whether ``value`` is an already numeric RHS callback."""
+
+    return callable(value) and not isinstance(value, sympy.Basic | sympy.MatrixBase)
+
+
+def _is_sequence(value: object) -> bool:
+    """Return whether ``value`` is a public sequence, excluding strings."""
+
+    return isinstance(value, Sequence) and not isinstance(value, str | bytes)
+
+
+def _subs_value(value: object, *args: object, **kwargs: object) -> object:
+    """Apply ``subs`` to SymPy-compatible containers and values."""
+
+    if isinstance(value, sympy.MatrixBase | sympy.Basic):
+        return value.subs(*args, **kwargs)
+    if _is_sequence(value):
+        return tuple(_subs_value(part, *args, **kwargs) for part in value)
+    return value
+
+
+def _xreplace_value(value: object, rule: Mapping[object, object]) -> object:
+    """Apply ``xreplace`` to SymPy-compatible containers and values."""
+
+    if isinstance(value, sympy.MatrixBase | sympy.Basic):
+        return value.xreplace(rule)
+    if _is_sequence(value):
+        return tuple(_xreplace_value(part, rule) for part in value)
+    return value
+
+
+def _remaining_explicit_parameters(
+    parameters: tuple[sympy.Symbol, ...],
+    parameters_were_explicit: bool,
+    *args: object,
+    **kwargs: object,
+) -> tuple[sympy.Symbol, ...]:
+    """Return explicit parameters that remain symbolic after substitution."""
+
+    if not parameters_were_explicit:
+        return ()
+    remaining: list[sympy.Symbol] = []
+    for parameter in parameters:
+        substituted = parameter.subs(*args, **kwargs)
+        if isinstance(substituted, sympy.Symbol):
+            remaining.append(substituted)
+    return tuple(dict.fromkeys(remaining))
+
+
+def _callback_parameter_dict(
+    parameter_values: Mapping[sympy.Symbol, object],
+) -> dict[object, object]:
+    """Return callback parameters by symbols and names."""
+
+    params: dict[object, object] = {}
+    for parameter, value in parameter_values.items():
+        params[parameter] = value
+        params[parameter.name] = value
+    return params
+
+
+def _component_display_name(key: object) -> str:
+    """Return a readable component name from a branch key."""
+
+    if isinstance(key, int):
+        return f"component_{key}"
+    if isinstance(key, sympy.Symbol):
+        return key.name
+    name = getattr(key, "__name__", None)
+    if isinstance(name, str):
+        return name
+    return str(key)
+
+
+IVP._solver = staticmethod(SolveIVP)
+
+
+
+================================================
+FILE: operator.py
+================================================
+"""Expose the public ``Num`` pipeline operator."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+from typing import Any
+
+from .compile import compile_num
+from .diagnostics import validate_warning_policy
+from .integration import integrate
+from .types import INDEX, SCALAR, ArrayType, IndexType, ScalarType
+
+
+@dataclass(frozen=True)
+class NumStage:
+    """Represent a configured ``Num(...)`` pipeline stage."""
+
+    args: tuple[Any, ...]
+    warnings: object
+    cache: object
+
+    def __post_init__(self) -> None:
+        """Validate options when the stage is created."""
+
+        validate_warning_policy(self.warnings)
+
+    def __rrshift__(self, expr: object) -> object:
+        """Compile the expression on the left of ``>>``."""
+
+        return compile_num(
+            expr,
+            args=self.args,
+            warnings=self.warnings,
+            cache=self.cache,
+        )
+
+    def __repr__(self) -> str:
+        """Return an interactive representation of the configured stage."""
+
+        arguments = [repr(arg) for arg in self.args]
+        if self.warnings != "collect":
+            arguments.append(f"warnings={self.warnings!r}")
+        if self.cache is not False:
+            arguments.append(f"cache={self.cache!r}")
+        return f"Num({', '.join(arguments)})"
+
+
+class NumOperator:
+    """Compile symbolic expressions into numeric values or callables."""
+
+    Scalar: ScalarType = SCALAR
+    Index: IndexType = INDEX
+    _mt_help = {
+        "path": PurePosixPath("library/Num"),
+        "anchor": None,
+        "label": "Num",
+    }
+
+    def Array(self, rank: int, element_type: object | None = None) -> ArrayType:
+        """Return an array numeric role with scalar elements by default."""
+
+        if element_type is None:
+            element_type = self.Scalar
+        return ArrayType(rank, element_type)
+
+    def Integrate(
+        self,
+        function: object,
+        ranges: object,
+        *,
+        domain_func: object | None = None,
+        args: tuple[object, ...] = (),
+        rule: str = "gk21",
+        rtol: float = 1e-8,
+        atol: float = 0.0,
+        max_subdivisions: int = 10000,
+        workers: int | object = 1,
+        points: object | None = None,
+    ) -> object:
+        """Integrate a numeric or symbolic function with SciPy cubature.
+
+        Parameters
+        ----------
+        function : object
+            Symbolic expression, compiled ``NumFunction``, or vectorized
+            callable to integrate.
+        ranges : object
+            Rectangular bounds such as ``[(x, -1, 1), (y, -1, 1)]``.
+        domain_func : object, optional
+            Numeric or symbolic function that is negative on the desired
+            domain and positive outside it.
+        args : tuple[object, ...], optional
+            Extra positional values passed after the coordinate arrays.
+        rule : str, optional
+            Cubature rule passed to SciPy.
+        rtol : float, optional
+            Relative integration tolerance.
+        atol : float, optional
+            Absolute integration tolerance.
+        max_subdivisions : int, optional
+            Maximum cubature subdivisions.
+        workers : int or object, optional
+            Worker configuration passed to SciPy.
+        points : object, optional
+            Points passed to SciPy for avoiding singularities.
+
+        Returns
+        -------
+        object
+            SciPy ``CubatureResult`` with ``estimate`` and ``error`` fields.
+        """
+
+        return integrate(
+            function,
+            ranges,
+            domain_func=domain_func,
+            args=args,
+            rule=rule,
+            rtol=rtol,
+            atol=atol,
+            max_subdivisions=max_subdivisions,
+            workers=workers,
+            points=points,
+        )
+
+    def __call__(
+        self,
+        *args: Any,
+        warnings: object = "collect",
+        cache: object = False,
+    ) -> NumStage:
+        """Return a configured ``Num`` pipeline stage."""
+
+        return NumStage(args=args, warnings=warnings, cache=cache)
+
+    def __rrshift__(self, expr: object) -> object:
+        """Compile the expression on the left of ``>>`` with default options."""
+
+        return compile_num(expr, args=(), warnings="collect", cache=False)
+
+    def __repr__(self) -> str:
+        """Return an interactive representation of the operator."""
+
+        return "<Num: use as expr >> Num or expr >> Num(...)>"
+
+
+Num = NumOperator()
+
+
+
+================================================
+FILE: shapes.py
+================================================
+"""Evaluate ``Num`` outputs with sample axes before mathematical axes."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+import numpy as np
+import sympy
+
+from .backend import build_backend_callable
+
+
+def build_output_evaluator(
+    expr: object,
+    arg_symbols: tuple[object, ...],
+    *,
+    custom_impls: dict[str, object] | None = None,
+) -> tuple[object, Callable[[tuple[object, ...]], object]]:
+    """Return raw callables and a shape-normalizing evaluator."""
+
+    if isinstance(expr, sympy.MatrixBase):
+        return _build_matrix_output_evaluator(
+            expr,
+            arg_symbols,
+            custom_impls=custom_impls,
+        )
+
+    raw = build_backend_callable(arg_symbols, expr, custom_impls=custom_impls)
+
+    def evaluate(values: tuple[object, ...]) -> object:
+        return raw(*values)
+
+    return raw, evaluate
+
+
+def _build_matrix_output_evaluator(
+    expr: sympy.MatrixBase,
+    arg_symbols: tuple[object, ...],
+    *,
+    custom_impls: dict[str, object] | None,
+) -> tuple[object, Callable[[tuple[object, ...]], object]]:
+    """Return entrywise callables for sample-first matrix output."""
+
+    rows, cols = expr.shape
+    entries = tuple(expr[row, col] for row in range(rows) for col in range(cols))
+    raw = tuple(
+        build_backend_callable(arg_symbols, entry, custom_impls=custom_impls)
+        for entry in entries
+    )
+
+    if rows == 1:
+        math_shape = (cols,)
+    elif cols == 1:
+        math_shape = (rows,)
+    else:
+        math_shape = (rows, cols)
+
+    def evaluate(values: tuple[object, ...]) -> object:
+        evaluated = [np.asarray(callable_entry(*values)) for callable_entry in raw]
+        if not evaluated:
+            return np.empty(math_shape)
+
+        # Broadcast every entry over the same sample axes, then append the
+        # mathematical vector or matrix axes at the end.
+        broadcasted = np.broadcast_arrays(*evaluated)
+        sample_shape = broadcasted[0].shape
+        stacked = np.stack(broadcasted, axis=-1)
+        return stacked.reshape(sample_shape + math_shape)
+
+    return raw, evaluate
+
+
+
+================================================
+FILE: solve.py
+================================================
+"""Dispatch symbolic numerical problems to their declared solvers."""
+
+from __future__ import annotations
+
+from .errors import NumArgumentError
+
+
+def Solve(problem: object, **kwargs: object) -> object:
+    """Dispatch a symbolic problem object to its private solver.
+
+    Parameters
+    ----------
+    problem : object
+        Symbolic problem object with a private ``_solver`` callable.
+    **kwargs : object
+        Solver-specific options forwarded without interpretation.
+
+    Returns
+    -------
+    object
+        Solver-specific Python result container.
+
+    Raises
+    ------
+    NumArgumentError
+        If ``problem`` does not declare a solver.
+
+    Examples
+    --------
+    Basic usage:
+
+    >>> from math_toolkit import IVP, Solve
+    >>> import sympy
+    >>> t, y = sympy.symbols("t y")
+    >>> solution = Solve(IVP([y], unknowns=[y], domain=(t, 0, 1), initial_data={y: 1}))
+    >>> len(solution)
+    1
+    """
+
+    solver = getattr(problem, "_solver", None)
+    if solver is None:
+        raise NumArgumentError(
+            "Solve expects a symbolic problem object with a declared solver."
+        )
+    return solver(problem, **kwargs)
+
+
+
+================================================
+FILE: specs.py
+================================================
+"""Normalize public ``Num`` argument specifications."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import keyword
+from typing import Any
+
+import sympy
+
+from .errors import NumArgumentError
+from .types import NumericArgType, SCALAR, is_numeric_arg_type
+
+
+@dataclass(frozen=True)
+class NumArgSpec:
+    """Describe one argument accepted by a ``NumFunction``.
+
+    Parameters
+    ----------
+    symbol : object
+        Symbolic object represented by the numeric argument.
+    name : str
+        External keyword name accepted by the numeric callable.
+    type : NumericArgType
+        Numeric role assigned to the argument.
+    """
+
+    symbol: object
+    name: str
+    type: NumericArgType
+
+
+def normalize_arg_specs(args: tuple[Any, ...]) -> tuple[NumArgSpec, ...]:
+    """Return validated public argument specifications in call order."""
+
+    specs = tuple(_normalize_one_arg_spec(arg) for arg in args)
+
+    # External names form the Python keyword surface of NumFunction calls.
+    seen_names: dict[str, NumArgSpec] = {}
+    for spec in specs:
+        previous = seen_names.get(spec.name)
+        if previous is not None:
+            raise NumArgumentError(
+                f"Num arguments use duplicate external name {spec.name!r}."
+            )
+        seen_names[spec.name] = spec
+    return specs
+
+
+def visible_name(symbol: object) -> str:
+    """Return the public symbolic base name used for role conflict checks."""
+
+    if isinstance(symbol, sympy.Indexed):
+        return visible_name(symbol.base)
+    if isinstance(symbol, sympy.IndexedBase):
+        label = symbol.label
+        if isinstance(label, sympy.Symbol):
+            return label.name
+        return str(label)
+    if isinstance(symbol, sympy.Symbol):
+        return symbol.name
+    return str(symbol)
+
+
+def make_indexed_base(symbol: object) -> sympy.IndexedBase:
+    """Return an ``IndexedBase`` matching a public array spec symbol."""
+
+    if isinstance(symbol, sympy.IndexedBase):
+        return symbol
+    if isinstance(symbol, sympy.Symbol):
+        return sympy.IndexedBase(symbol)
+    raise NumArgumentError(
+        f"Num array argument {symbol!r} must be a Symbol or IndexedBase."
+    )
+
+
+def _normalize_one_arg_spec(raw: Any) -> NumArgSpec:
+    """Return one validated ``NumArgSpec`` from the public grammar."""
+
+    if isinstance(raw, tuple) and len(raw) == 2 and isinstance(raw[1], dict):
+        symbol, options = raw
+        return _normalize_options_spec(symbol, options)
+    if isinstance(raw, tuple):
+        raise NumArgumentError(
+            "Num argument tuples must have the form (symbol, options_dict)."
+        )
+    return _make_spec(raw, name=None, arg_type=SCALAR)
+
+
+def _normalize_options_spec(symbol: object, options: dict[str, Any]) -> NumArgSpec:
+    """Return one spec from a symbol and public options dictionary."""
+
+    unknown = sorted(set(options) - {"name", "type"})
+    if unknown:
+        joined = ", ".join(unknown)
+        raise NumArgumentError(f"Unknown Num argument option(s): {joined}.")
+
+    name = options.get("name")
+    arg_type = options.get("type", SCALAR)
+    return _make_spec(symbol, name=name, arg_type=arg_type)
+
+
+def _make_spec(
+    symbol: object,
+    *,
+    name: object | None,
+    arg_type: object,
+) -> NumArgSpec:
+    """Validate one symbolic argument and return its public spec."""
+
+    if isinstance(symbol, sympy.Indexed):
+        raise NumArgumentError(
+            "Num array arguments use the visible base, such as x, not x[i]."
+        )
+    if not isinstance(symbol, sympy.Symbol | sympy.IndexedBase):
+        raise NumArgumentError(
+            f"Num argument {symbol!r} must be a Symbol or IndexedBase."
+        )
+    if not is_numeric_arg_type(arg_type):
+        raise NumArgumentError(
+            f"Num argument {visible_name(symbol)} uses unsupported type "
+            f"{arg_type!r}. MVP Num supports Num.Scalar, Num.Index, and "
+            "Num.Array(rank)."
+        )
+
+    external_name = visible_name(symbol) if name is None else name
+    if not isinstance(external_name, str):
+        raise NumArgumentError("Num argument name option must be a string.")
+    if not external_name.isidentifier() or keyword.iskeyword(external_name):
+        raise NumArgumentError(
+            f"Num argument name {external_name!r} must be a valid Python identifier."
+        )
+
+    return NumArgSpec(symbol=symbol, name=external_name, type=arg_type)
+
+
+
+================================================
+FILE: types.py
+================================================
+"""Represent numeric argument roles accepted by ``Num``."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TypeAlias
+
+
+@dataclass(frozen=True)
+class ScalarType:
+    """Represent a floating-point or array-broadcast scalar argument."""
+
+    def __repr__(self) -> str:
+        """Return the public constructor-style role name."""
+
+        return "Num.Scalar"
+
+
+@dataclass(frozen=True)
+class IndexType:
+    """Represent an integer-valued index argument."""
+
+    def __repr__(self) -> str:
+        """Return the public constructor-style role name."""
+
+        return "Num.Index"
+
+
+NumericElementType: TypeAlias = ScalarType | IndexType
+
+
+@dataclass(frozen=True)
+class ArrayType:
+    """Represent a numeric array-like argument.
+
+    Parameters
+    ----------
+    rank : int
+        Positive number of indices required to access one array element.
+    element_type : ScalarType | IndexType
+        Role of the elements stored in the array.
+    """
+
+    rank: int
+    element_type: NumericElementType
+
+    def __post_init__(self) -> None:
+        """Validate public array role construction."""
+
+        if not isinstance(self.rank, int) or isinstance(self.rank, bool):
+            raise TypeError("Num.Array(rank) requires a positive integer rank.")
+        if self.rank < 1:
+            raise ValueError("Num.Array(rank) requires a positive integer rank.")
+        if not isinstance(self.element_type, ScalarType | IndexType):
+            raise TypeError(
+                "Num.Array(rank, element_type) supports Num.Scalar or "
+                "Num.Index elements in the MVP."
+            )
+
+    def __repr__(self) -> str:
+        """Return the public constructor-style role name."""
+
+        if isinstance(self.element_type, ScalarType):
+            return f"Num.Array({self.rank})"
+        return f"Num.Array({self.rank}, {self.element_type!r})"
+
+
+NumericArgType: TypeAlias = ScalarType | IndexType | ArrayType
+
+SCALAR = ScalarType()
+INDEX = IndexType()
+
+
+def is_numeric_arg_type(value: object) -> bool:
+    """Return whether ``value`` is one of the supported public role objects."""
+
+    return isinstance(value, ScalarType | IndexType | ArrayType)
+
+

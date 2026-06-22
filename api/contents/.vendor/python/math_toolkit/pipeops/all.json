@@ -1,0 +1,57 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.837671Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-21T19:14:07.529252Z",
+      "mimetype": "text/x-python",
+      "name": "common_pipeops.py",
+      "path": ".vendor\\python\\math_toolkit\\pipeops/common_pipeops.py",
+      "size": 4716,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.838701Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-05-27T20:23:07.486172Z",
+      "mimetype": "text/x-python",
+      "name": "core.py",
+      "path": ".vendor\\python\\math_toolkit\\pipeops/core.py",
+      "size": 37723,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.836112Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-21T19:14:07.528220Z",
+      "mimetype": "text/x-python",
+      "name": "__init__.py",
+      "path": ".vendor\\python\\math_toolkit\\pipeops/__init__.py",
+      "size": 587,
+      "type": "file",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T01:13:01.836112Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T01:13:01.838701Z",
+  "mimetype": null,
+  "name": ".vendor\\python\\math_toolkit\\pipeops",
+  "path": ".vendor\\python\\math_toolkit\\pipeops",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

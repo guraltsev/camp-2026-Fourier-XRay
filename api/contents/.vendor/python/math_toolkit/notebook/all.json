@@ -1,0 +1,71 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.805857Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-21T19:14:07.521350Z",
+      "mimetype": "text/x-python",
+      "name": "activation.py",
+      "path": ".vendor\\python\\math_toolkit\\notebook/activation.py",
+      "size": 11464,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.806878Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-21T19:14:07.521866Z",
+      "mimetype": "text/x-python",
+      "name": "default_symbols.py",
+      "path": ".vendor\\python\\math_toolkit\\notebook/default_symbols.py",
+      "size": 2316,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.808464Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-05-27T20:23:07.468237Z",
+      "mimetype": "text/markdown",
+      "name": "Readme.md",
+      "path": ".vendor\\python\\math_toolkit\\notebook/Readme.md",
+      "size": 182,
+      "type": "file",
+      "writable": true
+    },
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.804786Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-05-27T20:23:07.469266Z",
+      "mimetype": "text/x-python",
+      "name": "__init__.py",
+      "path": ".vendor\\python\\math_toolkit\\notebook/__init__.py",
+      "size": 5397,
+      "type": "file",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T01:13:01.804267Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T01:13:01.808464Z",
+  "mimetype": null,
+  "name": ".vendor\\python\\math_toolkit\\notebook",
+  "path": ".vendor\\python\\math_toolkit\\notebook",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}

@@ -1,0 +1,29 @@
+{
+  "content": [
+    {
+      "content": null,
+      "created": "2026-06-22T01:13:01.730370Z",
+      "format": null,
+      "hash": null,
+      "hash_algorithm": null,
+      "last_modified": "2026-06-22T01:13:01.903408Z",
+      "mimetype": null,
+      "name": "math_toolkit",
+      "path": ".vendor\\python/math_toolkit",
+      "size": null,
+      "type": "directory",
+      "writable": true
+    }
+  ],
+  "created": "2026-06-22T01:13:01.730370Z",
+  "format": "json",
+  "hash": null,
+  "hash_algorithm": null,
+  "last_modified": "2026-06-22T01:13:01.730370Z",
+  "mimetype": null,
+  "name": ".vendor\\python",
+  "path": ".vendor\\python",
+  "size": null,
+  "type": "directory",
+  "writable": true
+}
