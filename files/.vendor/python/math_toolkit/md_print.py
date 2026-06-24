@@ -789,6 +789,24 @@ def _is_nonstring_iterable(value: Any) -> bool:
 class _MarkdownState:
     """Track enough markdown state to distinguish prose from math regions."""
 
+    _MATH_ENVIRONMENTS = frozenset(
+        {
+            "align",
+            "align*",
+            "alignat",
+            "alignat*",
+            "equation",
+            "equation*",
+            "flalign",
+            "flalign*",
+            "gather",
+            "gather*",
+            "multline",
+            "multline*",
+            "split",
+        }
+    )
+
     def __init__(self) -> None:
         self.in_math = False
         self._delimiter: str | None = None
@@ -860,7 +878,29 @@ class _MarkdownState:
         ):
             if text.startswith(opening, cursor):
                 return opening, closing
+        environment = _MarkdownState._opening_math_environment(text, cursor)
+        if environment is not None:
+            opening, name = environment
+            return opening, rf"\end{{{name}}}"
         return None
+
+    @staticmethod
+    def _opening_math_environment(text: str, cursor: int) -> tuple[str, str] | None:
+        """Return a LaTeX math environment opening and name at ``cursor``."""
+        prefix = r"\begin{"
+        if not text.startswith(prefix, cursor):
+            return None
+
+        name_start = cursor + len(prefix)
+        name_end = text.find("}", name_start)
+        if name_end == -1:
+            return None
+
+        name = text[name_start:name_end]
+        if name not in _MarkdownState._MATH_ENVIRONMENTS:
+            return None
+
+        return text[cursor : name_end + 1], name
 
 
 # ==============================================================================

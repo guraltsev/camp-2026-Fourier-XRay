@@ -1,8 +1,9 @@
 """Provide symbolic weighted Lebesgue norm notation for SymPy expressions.
 
 Use ``L1Norm``, ``L2Norm``, ``LinftyNorm``, or ``LpNorm(p)`` to build
-unevaluated norm expressions with explicit bound variables, domains, and
-optional nonnegative density weights. Finite norms rewrite explicitly to
+unevaluated norm expressions with explicit bound-variable domains such as
+``(x, a, b)``, repeated interval bindings, or ``((x, y), Omega)`` and
+``((x,), S.Reals)`` grouped domain bindings. Finite norms rewrite explicitly to
 ``Integral`` objects; infinity norms rewrite to the formal
 ``EssentialSupremum`` object.
 """
@@ -99,21 +100,21 @@ class LebesgueNormBase(sympy.Expr):
     def __new__(
         cls,
         expr: Any,
-        vars: Any = None,
-        domain: Any = None,
+        *bindings: Any,
         weight: Any = sympy.S.One,
     ) -> sympy.Expr:
         """Create an unevaluated norm expression."""
 
         # SymPy reconstruction passes the component nodes from ``.args`` back
         # to the constructor. Keep that path separate from public construction.
-        if _is_component_form(expr, vars, domain, weight):
+        if _is_component_form(expr, bindings, weight):
             operand = expr
-            binding = vars
-            density = domain
+            binding = bindings[0]
+            density = bindings[1]
         else:
+            variables, normalized_domain = _normalize_public_binding(*bindings)
             operand = NormOperand(expr)
-            binding = BoundDomain(vars, domain)
+            binding = BoundDomain(variables, normalized_domain)
             density = NormWeight(weight)
 
         if operand.expr.is_zero:
@@ -198,8 +199,7 @@ class LebesgueNormBase(sympy.Expr):
         # through the public constructor revalidates changed domains and weights.
         return self.func(
             self.expr._subs(old, new),
-            self.variables,
-            self.domain._subs(old, new),
+            *_binding_as_public_args(self.variables, self.domain._subs(old, new)),
             weight=self.weight._subs(old, new),
         )
 
@@ -228,7 +228,11 @@ class LebesgueNormBase(sympy.Expr):
         changed = expr_changed or domain_changed or weight_changed or variables_changed
         if not changed:
             return self, False
-        return self.func(expr, tuple(variables), domain, weight=weight), True
+        return self.func(
+            expr,
+            *_binding_as_public_args(tuple(variables), domain),
+            weight=weight,
+        ), True
 
     def _eval_expand_norm(self, **hints: Any) -> sympy.Basic:
         """Expand the norm to its explicit formal definition."""
@@ -258,10 +262,10 @@ class LebesgueNormBase(sympy.Expr):
     def _sympystr(self, printer: Any) -> str:
         """Render a semantic plain-text representation."""
 
-        variables = _format_variables(self.variables, printer)
+        binding = _format_binding(self.variables, self.domain, printer)
         rendered = (
             f"{self.func.__name__}("
-            f"{printer._print(self.expr)}, {variables}, {printer._print(self.domain)}"
+            f"{printer._print(self.expr)}, {binding}"
         )
         if self.weight != sympy.S.One:
             rendered += f", weight={printer._print(self.weight)}"
@@ -321,8 +325,7 @@ class LinftyNorm(LebesgueNormBase):
 
         return EssentialSupremum(
             sympy.Abs(self.expr),
-            self.variables,
-            self.domain,
+            *_binding_as_public_args(self.variables, self.domain),
             weight=self.weight,
         )
 
@@ -336,19 +339,19 @@ class EssentialSupremum(sympy.Expr):
     def __new__(
         cls,
         expr: Any,
-        vars: Any = None,
-        domain: Any = None,
+        *bindings: Any,
         weight: Any = sympy.S.One,
     ) -> "EssentialSupremum":
         """Create an unevaluated essential supremum expression."""
 
-        if _is_component_form(expr, vars, domain, weight):
+        if _is_component_form(expr, bindings, weight):
             operand = expr
-            binding = vars
-            density = domain
+            binding = bindings[0]
+            density = bindings[1]
         else:
+            variables, normalized_domain = _normalize_public_binding(*bindings)
             operand = NormOperand(expr)
-            binding = BoundDomain(vars, domain)
+            binding = BoundDomain(variables, normalized_domain)
             density = NormWeight(weight)
         return sympy.Expr.__new__(cls, operand, binding, density)
 
@@ -414,10 +417,10 @@ class EssentialSupremum(sympy.Expr):
     def _sympystr(self, printer: Any) -> str:
         """Render a semantic plain-text representation."""
 
-        variables = _format_variables(self.variables, printer)
+        binding = _format_binding(self.variables, self.domain, printer)
         rendered = (
             f"EssentialSupremum("
-            f"{printer._print(self.expr)}, {variables}, {printer._print(self.domain)}"
+            f"{printer._print(self.expr)}, {binding}"
         )
         if self.weight != sympy.S.One:
             rendered += f", weight={printer._print(self.weight)}"
@@ -486,14 +489,55 @@ EssentialSupremum._mt_help = _LP_NORMS_DOC
 LpNorm._mt_help = _LP_NORMS_DOC
 
 
-def _is_component_form(expr: Any, vars: Any, domain: Any, weight: Any) -> bool:
+def _is_component_form(expr: Any, bindings: tuple[Any, ...], weight: Any) -> bool:
     """Return whether constructor arguments are internal component nodes."""
 
     return (
         isinstance(expr, NormOperand)
-        and isinstance(vars, BoundDomain)
-        and isinstance(domain, NormWeight)
+        and len(bindings) == 2
+        and isinstance(bindings[0], BoundDomain)
+        and isinstance(bindings[1], NormWeight)
         and weight == sympy.S.One
+    )
+
+
+def _normalize_public_binding(*bindings: Any) -> tuple[tuple[sympy.Symbol, ...], sympy.Basic]:
+    """Return variables and domain from public norm binding arguments."""
+
+    if not bindings:
+        raise ValueError("bound-domain specification must be specified")
+
+    if all(_is_bounded_interval_binding(binding) for binding in bindings):
+        if len(bindings) == 1:
+            variable, lower, upper = tuple(bindings[0])
+            variables = _normalize_variables(variable)
+            return variables, _normalize_domain((lower, upper), variables)
+
+        variables = _normalize_variables(tuple(binding[0] for binding in bindings))
+        domain_spec = tuple((binding[1], binding[2]) for binding in bindings)
+        return variables, _normalize_domain(domain_spec, variables)
+
+    if len(bindings) == 1 and isinstance(bindings[0], tuple | list | sympy.Tuple):
+        entries = tuple(bindings[0])
+
+        if entries and all(_is_bounded_interval_binding(entry) for entry in entries):
+            variables = _normalize_variables(tuple(entry[0] for entry in entries))
+            domain_spec = tuple((entry[1], entry[2]) for entry in entries)
+            return variables, _normalize_domain(domain_spec, variables)
+
+        if len(entries) == 2 and _is_grouped_domain_binding(entries):
+            variables = _normalize_variables(entries[0])
+            return variables, _normalize_domain(entries[1], variables)
+
+    if len(bindings) == 3 and isinstance(bindings[0], sympy.Symbol):
+        variable, lower, upper = bindings
+        variables = _normalize_variables(variable)
+        return variables, _normalize_domain((lower, upper), variables)
+
+    raise ValueError(
+        "bound-domain specification must be (x, a, b), "
+        "(x, a, b), (y, c, d), ..., ((x, y, z), domain), "
+        "or ((x,), domain)"
     )
 
 
@@ -612,6 +656,25 @@ def _is_interval_spec(value: Any) -> bool:
     return isinstance(value, tuple | list | sympy.Tuple) and len(value) == 2
 
 
+def _is_bounded_interval_binding(value: Any) -> bool:
+    """Return whether ``value`` is ``(symbol, lower, upper)`` shorthand."""
+
+    if not isinstance(value, tuple | list | sympy.Tuple) or len(value) != 3:
+        return False
+    return isinstance(value[0], sympy.Symbol)
+
+
+def _is_grouped_domain_binding(entries: tuple[Any, ...]) -> bool:
+    """Return whether a single tuple uses the grouped ``(variables, domain)`` form."""
+
+    variables = entries[0]
+    if isinstance(variables, sympy.Symbol):
+        return False
+    if not isinstance(variables, tuple | sympy.Tuple):
+        return False
+    return True
+
+
 def _reject_bound_symbols_in_domain(
     domain: sympy.Basic,
     variables: tuple[sympy.Symbol, ...],
@@ -654,6 +717,62 @@ def _format_variables(variables: tuple[sympy.Symbol, ...], printer: Any) -> str:
     if len(variables) == 1:
         return printer._print(variables[0])
     return "(" + ", ".join(printer._print(variable) for variable in variables) + ")"
+
+
+def _format_variable_tuple(variables: tuple[sympy.Symbol, ...], printer: Any) -> str:
+    """Return a plain-text tuple of variables for grouped domain syntax."""
+
+    if len(variables) == 1:
+        return f"({printer._print(variables[0])},)"
+    return "(" + ", ".join(printer._print(variable) for variable in variables) + ")"
+
+
+def _format_binding(
+    variables: tuple[sympy.Symbol, ...],
+    domain: sympy.Basic,
+    printer: Any,
+) -> str:
+    """Return a plain-text bound-domain display matching public syntax."""
+
+    if len(variables) == 1 and isinstance(domain, sympy.Interval):
+        variable = printer._print(variables[0])
+        return f"({variable}, {printer._print(domain.start)}, {printer._print(domain.end)})"
+
+    if isinstance(domain, sympy.ProductSet):
+        factors = tuple(domain.sets)
+        if len(factors) == len(variables) and all(
+            isinstance(factor, sympy.Interval) for factor in factors
+        ):
+            bindings = (
+                f"({printer._print(variable)}, "
+                f"{printer._print(factor.start)}, {printer._print(factor.end)})"
+                for variable, factor in zip(variables, factors)
+            )
+            return ", ".join(bindings)
+
+    return f"({_format_variable_tuple(variables, printer)}, {printer._print(domain)})"
+
+
+def _binding_as_public_args(
+    variables: tuple[sympy.Symbol, ...],
+    domain: sympy.Basic,
+) -> tuple[Any, ...]:
+    """Return constructor binding arguments preserving public notation."""
+
+    if len(variables) == 1 and isinstance(domain, sympy.Interval):
+        return ((variables[0], domain.start, domain.end),)
+
+    if isinstance(domain, sympy.ProductSet):
+        factors = tuple(domain.sets)
+        if len(factors) == len(variables) and all(
+            isinstance(factor, sympy.Interval) for factor in factors
+        ):
+            return tuple(
+                (variable, factor.start, factor.end)
+                for variable, factor in zip(variables, factors)
+            )
+
+    return ((variables, domain),)
 
 
 def _private_lp_class_name(p: sympy.Basic) -> str:

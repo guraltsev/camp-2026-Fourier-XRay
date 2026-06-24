@@ -598,6 +598,46 @@ class NumCompiler:
             if vector_cache_key is not None and vector_cache_key in vector_cache:
                 return vector_cache[vector_cache_key].copy()
 
+            indexed_ranks = _indexed_base_ranks(node)
+            if _integral_integrator(hints) == "Sampled":
+                sampled_result = _sample_integral_at_parameter_grid(
+                    compiled_limits,
+                    integrand_node,
+                    env,
+                    exec_meta,
+                    hints,
+                    broadcast_shape,
+                    broadcasted_values,
+                )
+                _seed_scalar_integral_cache_from_broadcast_result(
+                    runtime_symbols,
+                    env,
+                    broadcasted_values,
+                    indexed_ranks,
+                    sampled_result,
+                    scalar_cache,
+                )
+                if vector_cache_key is not None:
+                    _store_limited_vector_integral_cache(
+                        vector_cache,
+                        vector_cache_key,
+                        sampled_result,
+                    )
+                return sampled_result
+
+            scalar_cached_result = _evaluate_from_scalar_integral_cache(
+                runtime_symbols,
+                env,
+                broadcasted_values,
+                broadcast_shape,
+                indexed_ranks,
+                scalar_cache,
+                integrate_scalar_point,
+                exec_meta,
+            )
+            if scalar_cached_result is not None:
+                return scalar_cached_result
+
             vectorized_result = None
             if _integral_vector_valued_enabled(hints):
                 vectorized_result = _integrate_vectorized_1d_with_cubature(
@@ -626,6 +666,14 @@ class NumCompiler:
                         broadcasted_values,
                     )
             if vectorized_result is not None:
+                _seed_scalar_integral_cache_from_broadcast_result(
+                    runtime_symbols,
+                    env,
+                    broadcasted_values,
+                    indexed_ranks,
+                    vectorized_result,
+                    scalar_cache,
+                )
                 if vector_cache_key is not None:
                     _store_limited_vector_integral_cache(
                         vector_cache,
@@ -635,18 +683,13 @@ class NumCompiler:
                 return vectorized_result
 
             result = np.empty(broadcast_shape, dtype=float)
-            indexed_ranks = _indexed_base_ranks(node)
             for index in np.ndindex(result.shape):
-                point_env = dict(env)
-                for symbol, array in broadcasted_values.items():
-                    if symbol in indexed_ranks:
-                        point_env[symbol] = _indexed_parameter_axis_slice(
-                            array,
-                            indexed_ranks[symbol],
-                            index,
-                        )
-                    else:
-                        point_env[symbol] = _to_python_scalar(array[index])
+                point_env = _runtime_integral_scalar_point_env(
+                    env,
+                    broadcasted_values,
+                    indexed_ranks,
+                    index,
+                )
                 result[index] = integrate_scalar_point(point_env, exec_meta)
             if vector_cache_key is not None:
                 _store_limited_vector_integral_cache(vector_cache, vector_cache_key, result)
@@ -1408,8 +1451,7 @@ def _compile_infinity_norm(ctx: CompilationContext) -> LoweredCallable:
     node = ctx.current_node
     supremum = EssentialSupremum(
         sympy.Abs(node.expr),
-        node.variables,
-        node.domain,
+        (node.variables, node.domain),
         weight=node.weight,
     )
     return _compile_essential_supremum(ctx, supremum=supremum)
@@ -2663,10 +2705,16 @@ def _sample_integral_at_parameter_point(
     sample_count = _integral_sample_count(hints)
     points = np.linspace(lower, upper, sample_count, dtype=float)
     local_env = dict(env)
-    local_env[var] = points
     try:
-        values = _evaluate_integrand_grid(integrand_node, local_env, exec_meta, points.shape)
-        values = np.broadcast_to(values, points.shape)
+        values = _evaluate_sampled_integral_grid(
+            integrand_node,
+            local_env,
+            exec_meta,
+            var,
+            points,
+            points.shape,
+            hints,
+        )
     except Exception:
         values = np.empty(points.shape, dtype=float)
         for index, point in enumerate(points):
@@ -2675,6 +2723,79 @@ def _sample_integral_at_parameter_point(
     if not np.all(np.isfinite(values)):
         raise NumEvaluationError("The sampled integral fallback produced a non-finite value.")
     return _sampled_integral_value(values, points)
+
+
+def _sample_integral_at_parameter_grid(
+    compiled_limits: list[tuple[sympy.Symbol, _CompiledNode, _CompiledNode]],
+    integrand_node: _CompiledNode,
+    env: dict[sympy.Symbol, Any],
+    exec_meta: LastExecutionMetadata,
+    hints: Mapping[str, Any],
+    broadcast_shape: tuple[int, ...],
+    broadcasted_values: Mapping[sympy.Symbol, np.ndarray],
+) -> np.ndarray:
+    """Approximate a 1D integral for a whole broadcasted parameter grid."""
+    if len(compiled_limits) != 1:
+        raise NumEvaluationError("Sampled integral fallback supports one-dimensional finite integrals.")
+
+    var, lower_node, upper_node = compiled_limits[0]
+    lower = _bound_to_float(lower_node.evaluator(env, exec_meta))
+    upper = _bound_to_float(upper_node.evaluator(env, exec_meta))
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        raise NumEvaluationError("Sampled integral fallback requires finite bounds.")
+
+    points = np.linspace(lower, upper, _integral_sample_count(hints), dtype=float)
+    local_env = dict(env)
+    for symbol, array in broadcasted_values.items():
+        if isinstance(symbol, sympy.IndexedBase):
+            local_env[symbol] = np.asarray(array)
+        else:
+            local_env[symbol] = np.asarray(array).reshape((1,) + broadcast_shape)
+
+    expected_shape = (points.size,) + broadcast_shape
+    values = _evaluate_sampled_integral_grid(
+        integrand_node,
+        local_env,
+        exec_meta,
+        var,
+        points,
+        expected_shape,
+        hints,
+    )
+    if not np.all(np.isfinite(values)):
+        raise NumEvaluationError("The sampled integral fallback produced a non-finite value.")
+    return _sampled_integral_value_axis0(values, points)
+
+
+def _evaluate_sampled_integral_grid(
+    integrand_node: _CompiledNode,
+    local_env: dict[sympy.Symbol, Any],
+    exec_meta: LastExecutionMetadata,
+    var: sympy.Symbol,
+    points: np.ndarray,
+    expected_shape: tuple[int, ...],
+    hints: Mapping[str, Any],
+) -> np.ndarray:
+    """Evaluate sampled-integral values in bounded chunks."""
+    chunk_size = _integral_sample_chunk_size(hints)
+    if points.size <= chunk_size:
+        local_env[var] = points.reshape((points.size,) + (1,) * (len(expected_shape) - 1))
+        return np.broadcast_to(
+            _evaluate_integrand_grid(integrand_node, local_env, exec_meta, expected_shape),
+            expected_shape,
+        )
+
+    values = np.empty(expected_shape, dtype=float)
+    for start in range(0, points.size, chunk_size):
+        stop = min(start + chunk_size, points.size)
+        point_chunk = points[start:stop]
+        chunk_shape = (point_chunk.size,) + expected_shape[1:]
+        local_env[var] = point_chunk.reshape((point_chunk.size,) + (1,) * (len(expected_shape) - 1))
+        values[start:stop] = np.broadcast_to(
+            _evaluate_integrand_grid(integrand_node, local_env, exec_meta, chunk_shape),
+            chunk_shape,
+        )
+    return values
 
 
 def _sampled_integral_value(values: np.ndarray, points: np.ndarray) -> float:
@@ -2687,6 +2808,17 @@ def _sampled_integral_value(values: np.ndarray, points: np.ndarray) -> float:
         total = total + 2.0 * np.sum(values[2:-1:2])
         return float(step * total / 3.0)
     return float(np.trapezoid(values, points))
+
+
+def _sampled_integral_value_axis0(values: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Return sampled 1D integrals over axis 0 using Simpson's rule when possible."""
+    if values.ndim >= 1 and values.shape[0] == points.size and values.shape[0] >= 3 and values.shape[0] % 2 == 1:
+        step = (float(points[-1]) - float(points[0])) / float(values.shape[0] - 1)
+        total = values[0] + values[-1]
+        total = total + 4.0 * np.sum(values[1:-1:2], axis=0)
+        total = total + 2.0 * np.sum(values[2:-1:2], axis=0)
+        return np.asarray(step * total / 3.0, dtype=float)
+    return np.asarray(np.trapezoid(values, points, axis=0), dtype=float)
 
 
 def _evaluate_integrand_grid(
@@ -2725,6 +2857,18 @@ def _integral_sample_count(hints: Mapping[str, Any]) -> int:
     if sample_count % 2 == 0:
         sample_count += 1
     return sample_count
+
+
+def _integral_sample_chunk_size(hints: Mapping[str, Any]) -> int:
+    """Return the maximum sampled-integral grid points evaluated at once."""
+    raw_value = _integral_runtime_hint(hints, "sample_chunk_size", None)
+    if raw_value is None:
+        raw_value = hints.get("IntegralSampleChunkSize", hints.get("integral_sample_chunk_size", 4096))
+    try:
+        chunk_size = int(raw_value)
+    except Exception:
+        chunk_size = 4096
+    return max(chunk_size, 1)
 
 
 def _integrate_vectorized_1d_with_quad_vec(
@@ -3153,6 +3297,112 @@ def _runtime_integral_vector_cache_key(
             )
         )
     return tuple(pieces)
+
+
+def _evaluate_from_scalar_integral_cache(
+    runtime_symbols: frozenset[sympy.Symbol],
+    env: Mapping[sympy.Symbol, Any],
+    broadcasted_values: Mapping[sympy.Symbol, np.ndarray],
+    broadcast_shape: tuple[int, ...],
+    indexed_ranks: Mapping[sympy.Basic, int],
+    scalar_cache: dict[tuple[tuple[str, Any], ...], float],
+    integrate_scalar_point: Callable[[dict[sympy.Symbol, Any], LastExecutionMetadata], float],
+    exec_meta: LastExecutionMetadata,
+) -> np.ndarray | None:
+    """Return a broadcast result from scalar cache entries when that is cheaper."""
+    if _broadcast_point_count(broadcast_shape) > 4096:
+        return None
+
+    cached_values: dict[tuple[int, ...], float] = {}
+    missing_points: list[
+        tuple[tuple[int, ...], dict[sympy.Symbol, Any], tuple[tuple[str, Any], ...]]
+    ] = []
+
+    # A first vectorized call should still use the vector-valued integrator.
+    # Once a nearby prefix is cached, only a small number of new coefficients
+    # need scalar work during slider steps.
+    for index in np.ndindex(broadcast_shape):
+        point_env = _runtime_integral_scalar_point_env(
+            env,
+            broadcasted_values,
+            indexed_ranks,
+            index,
+        )
+        cache_key = _runtime_integral_cache_key(runtime_symbols, point_env)
+        if cache_key is None:
+            return None
+        if cache_key in scalar_cache:
+            cached_values[index] = scalar_cache[cache_key]
+        else:
+            missing_points.append((index, point_env, cache_key))
+
+    if not cached_values:
+        return None
+    if missing_points and len(missing_points) > 8:
+        return None
+
+    result = np.empty(broadcast_shape, dtype=float)
+    for index, value in cached_values.items():
+        result[index] = value
+    for index, point_env, cache_key in missing_points:
+        value = integrate_scalar_point(point_env, exec_meta)
+        scalar_cache[cache_key] = value
+        result[index] = value
+    return result
+
+
+def _seed_scalar_integral_cache_from_broadcast_result(
+    runtime_symbols: frozenset[sympy.Symbol],
+    env: Mapping[sympy.Symbol, Any],
+    broadcasted_values: Mapping[sympy.Symbol, np.ndarray],
+    indexed_ranks: Mapping[sympy.Basic, int],
+    result: Any,
+    scalar_cache: dict[tuple[tuple[str, Any], ...], float],
+) -> None:
+    """Populate scalar integral cache entries from a vector-valued result."""
+    values = np.asarray(result, dtype=float)
+    if values.shape == ():
+        return
+    if _broadcast_point_count(values.shape) > 4096:
+        return
+
+    for index in np.ndindex(values.shape):
+        point_env = _runtime_integral_scalar_point_env(
+            env,
+            broadcasted_values,
+            indexed_ranks,
+            index,
+        )
+        cache_key = _runtime_integral_cache_key(runtime_symbols, point_env)
+        if cache_key is not None:
+            scalar_cache[cache_key] = float(values[index])
+
+
+def _broadcast_point_count(shape: tuple[int, ...]) -> int:
+    """Return the number of scalar broadcast points represented by a shape."""
+    if not shape:
+        return 1
+    return int(np.prod(shape, dtype=int))
+
+
+def _runtime_integral_scalar_point_env(
+    env: Mapping[sympy.Symbol, Any],
+    broadcasted_values: Mapping[sympy.Symbol, np.ndarray],
+    indexed_ranks: Mapping[sympy.Basic, int],
+    index: tuple[int, ...],
+) -> dict[sympy.Symbol, Any]:
+    """Return the scalar environment for one broadcasted integral point."""
+    point_env = dict(env)
+    for symbol, array in broadcasted_values.items():
+        if symbol in indexed_ranks:
+            point_env[symbol] = _indexed_parameter_axis_slice(
+                array,
+                indexed_ranks[symbol],
+                index,
+            )
+        else:
+            point_env[symbol] = _to_python_scalar(array[index])
+    return point_env
 
 
 def _cached_vectorized_callable(

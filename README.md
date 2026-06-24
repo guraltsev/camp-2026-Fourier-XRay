@@ -54,11 +54,11 @@ Open the notebook environment: [https://guraltsev.github.io/camp-2026-Fourier-XR
 
 Open a notebook workspace:
 
-- [Polynomial Interpolation Instability](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/001-polynomial_interpolation)
-- [Pure Trig And Sounds](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/002-pure_trig_and_sounds)
-- [Pure Trig Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/003-pure_trig_fourier_matching_game)
-- [Square Wave Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/004-square_wave_fourier_matching_game)
-- [Products Of Fourier Modes](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/workspaces/005-Products_of_fourier_modes)
+- [Polynomial Interpolation Instability](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html?workspace=001-polynomial_interpolation)
+- [Pure Trig And Sounds](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html?workspace=002-pure_trig_and_sounds)
+- [Pure Trig Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html?workspace=003-pure_trig_fourier_matching_game)
+- [Square Wave Fourier Matching Game](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html?workspace=004-square_wave_fourier_matching_game)
+- [Products Of Fourier Modes](https://guraltsev.github.io/camp-2026-Fourier-XRay/lab/index.html?workspace=005-Products_of_fourier_modes)
 <!-- jupyterlite-lab-url:end -->
 
 To preview locally:

@@ -116,19 +116,24 @@ def workspace_title(workspace_id: str, workspace: dict) -> str:
 
 
 def refresh_workspace_index(root: Path) -> dict[str, dict]:
-    workspaces_dir = root / "files" / ".workspaces"
-    workspace_index: dict[str, dict] = {}
+    workspaces_dir = root / "files" / "workspaces"
+    api_dir = root / "api" / "workspaces"
+    api_path = api_dir / "all.json"
+    workspace_index: dict[str, dict] = (
+        json.loads(api_path.read_text(encoding="utf-8")) if api_path.is_file() else {}
+    )
 
-    # Publish bundled workspace files through JupyterLite's static workspace API
-    # so /lab/workspaces/<id> opens with the intended notebook already active.
+    # Deploy repositories usually already carry api/workspaces/all.json from the
+    # template build. If raw workspace files are also present, refresh the API
+    # from them so local edits still propagate.
     if workspaces_dir.is_dir():
+        workspace_index = {}
         for path in sorted(workspaces_dir.glob("*.jupyterlab-workspace")):
             workspace = json.loads(path.read_text(encoding="utf-8"))
             metadata = workspace.setdefault("metadata", {})
             workspace_id = metadata.setdefault("id", path.stem)
             workspace_index[workspace_id] = workspace
 
-    api_dir = root / "api" / "workspaces"
     api_dir.mkdir(parents=True, exist_ok=True)
     (api_dir / "all.json").write_text(
         json.dumps(workspace_index, indent=2, sort_keys=True) + "\n",
@@ -146,7 +151,9 @@ def patch_readme(readme_path: Path, site_url: str, workspaces: dict[str, dict]) 
     lab_url = site_url + "lab/index.html"
     workspace_lines = []
     for workspace_id, workspace in sorted(workspaces.items()):
-        workspace_url = site_url + "lab/workspaces/" + quote(workspace_id, safe="")
+        workspace_url = site_url + "lab/index.html?workspace=" + quote(
+            workspace_id, safe=""
+        )
         workspace_lines.append(
             f"- [{workspace_title(workspace_id, workspace)}]({workspace_url})"
         )

@@ -236,10 +236,15 @@ def compile_numeric_info(
     # into the array argument shape that Num expects.
     numeric_symbols, pack = _numeric_parameter_binding(parameter_symbols)
     try:
+        info_hints = {
+            "Integrator": "Sampled",
+            "sample_count": 4097,
+            "sample_chunk_size": 1024,
+        }
         numeric = (
-            expression >> Num(var=numeric_symbols, Integral={"Integrator": "Sampled"})
+            expression >> Num(var=numeric_symbols, Integral=info_hints)
             if numeric_symbols
-            else expression >> Num(Integral={"Integrator": "Sampled"})
+            else expression >> Num(Integral=info_hints)
         )
     except Exception as exc:
         raise PlotCompilationError(
