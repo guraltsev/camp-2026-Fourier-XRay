@@ -91,12 +91,15 @@ class BoxWidget(_widget_base_class()):
 .mt-param-row__slider-stack {
   flex: 0 1 auto;
   justify-content: flex-start;
-  min-width: calc(10ch + 4rem + 0.36rem);
+  min-width: calc(10ch + 5.3rem + 0.54rem);
 }
 .mt-param-row__slider-stack > *:nth-child(2) {
   flex: 1 1 4rem;
   max-width: 12rem;
   min-width: 4rem;
+}
+.mt-param-row__animate {
+  flex: 0 0 1.3rem;
 }
 .mt-param-row__edit {
   flex: 0 0 1.3rem;
@@ -328,6 +331,7 @@ class TextEntryWidget(_widget_base_class()):
     value = traitlets.Unicode("").tag(sync=True)
     disabled = traitlets.Bool(False).tag(sync=True)
     commit_count = traitlets.Int(0).tag(sync=True)
+    commit_message_type = traitlets.Unicode("").tag(sync=True)
     class_name = traitlets.Unicode("").tag(sync=True)
     style = traitlets.Dict(default_value={}).tag(sync=True)
 
@@ -403,9 +407,14 @@ function render({ model, el }) {
   }
 
   input.addEventListener("change", () => {
-    model.set("value", input.value);
-    model.set("commit_count", model.get("commit_count") + 1);
-    model.save_changes();
+    const messageType = model.get("commit_message_type") || "";
+    if (messageType) {
+      model.send({ type: messageType, value: input.value });
+    } else {
+      model.set("value", input.value);
+      model.set("commit_count", model.get("commit_count") + 1);
+      model.save_changes();
+    }
   });
 
   for (const name of ["value", "disabled", "class_name", "style"]) {
@@ -428,6 +437,7 @@ export default { render };
         value: str = "",
         *,
         disabled: bool = False,
+        commit_message_type: str = "",
         class_name: str = "",
         style: dict[str, str] | None = None,
     ) -> None:
@@ -436,6 +446,7 @@ export default { render };
         super().__init__()
         self.value = value
         self.disabled = disabled
+        self.commit_message_type = commit_message_type
         self.class_name = class_name
         self.style = {} if style is None else dict(style)
 
@@ -738,6 +749,7 @@ class ButtonWidget(_widget_base_class()):
     title = traitlets.Unicode("").tag(sync=True)
     disabled = traitlets.Bool(False).tag(sync=True)
     click_count = traitlets.Int(0).tag(sync=True)
+    click_message_type = traitlets.Unicode("").tag(sync=True)
     class_name = traitlets.Unicode("").tag(sync=True)
 
     _css = r"""
@@ -784,6 +796,21 @@ function refreshSvg() {
     </svg>`;
 }
 
+function playSvg() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+      <path d="M8 5v14l11-7Z"></path>
+    </svg>`;
+}
+
+function pauseSvg() {
+  return `
+    <svg viewBox="0 0 24 24" aria-hidden="true" fill="currentColor">
+      <path d="M7 5h4v14H7Z"></path>
+      <path d="M13 5h4v14h-4Z"></path>
+    </svg>`;
+}
+
 function render({ model, el }) {
   const button = document.createElement("button");
   button.type = "button";
@@ -799,6 +826,12 @@ function render({ model, el }) {
       button.innerHTML = refreshSvg();
       button.classList.add("mt-button--reset");
       button.setAttribute("aria-label", model.get("title") || "Reset");
+    } else if (label === "play") {
+      button.innerHTML = playSvg();
+      button.setAttribute("aria-label", model.get("title") || "Animate parameter");
+    } else if (label === "pause") {
+      button.innerHTML = pauseSvg();
+      button.setAttribute("aria-label", model.get("title") || "Pause parameter animation");
     } else {
       button.textContent = label;
       button.removeAttribute("aria-label");
@@ -808,8 +841,15 @@ function render({ model, el }) {
   }
 
   button.addEventListener("click", () => {
-    model.set("click_count", model.get("click_count") + 1);
-    model.save_changes();
+    const messageType = model.get("click_message_type") || "";
+    if (messageType) {
+      const label = model.get("label") || "";
+      const action = label === "pause" ? "pause" : label === "play" ? "play" : "click";
+      model.send({ type: messageType, action });
+    } else {
+      model.set("click_count", model.get("click_count") + 1);
+      model.save_changes();
+    }
   });
 
   for (const name of ["label", "title", "disabled", "class_name"]) {
@@ -833,6 +873,7 @@ export default { render };
         *,
         title: str = "",
         disabled: bool = False,
+        click_message_type: str = "",
         class_name: str = "",
     ) -> None:
         """Create a button widget."""
@@ -841,4 +882,5 @@ export default { render };
         self.label = label
         self.title = title
         self.disabled = disabled
+        self.click_message_type = click_message_type
         self.class_name = class_name

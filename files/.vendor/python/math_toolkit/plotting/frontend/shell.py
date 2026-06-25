@@ -345,6 +345,9 @@ class FigureShellWidget(_shell_base_class()):
   padding: 0;
   width: 1.3rem;
 }
+.mt-icon-button[hidden] {
+  display: none;
+}
 .mt-icon-button svg {
   height: 1rem;
   width: 1rem;
@@ -503,7 +506,48 @@ class FigureShellWidget(_shell_base_class()):
   gap: 0.55rem;
   min-width: 0;
 }
+.mt-modal__tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  min-width: 0;
+}
+.mt-modal__tablist {
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  min-width: 0;
+}
+.mt-modal__tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: #475569;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  min-height: 1.85rem;
+  padding: 0.28rem 0.5rem;
+}
+.mt-modal__tab:hover {
+  color: #0f172a;
+}
+.mt-modal__tab[aria-selected="true"] {
+  border-bottom-color: #2563eb;
+  color: #1d4ed8;
+}
+.mt-modal__tabpanel[hidden] {
+  display: none;
+}
 .mt-field-row-pair {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1.35rem;
+  justify-content: space-between;
+  min-width: 0;
+}
+.mt-field-row-cluster {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem 1.35rem;
@@ -514,7 +558,14 @@ class FigureShellWidget(_shell_base_class()):
   flex: 0 1 auto;
   min-width: min(100%, max-content);
 }
+.mt-field-row-cluster .mt-field-row {
+  flex: 0 1 auto;
+  min-width: min(100%, max-content);
+}
 .mt-field-row-pair .mt-field-row__label {
+  white-space: nowrap;
+}
+.mt-field-row-cluster .mt-field-row__label {
   white-space: nowrap;
 }
 .mt-field-row {
@@ -767,6 +818,7 @@ function render({ model, el }) {
   let legendRenderToken = 0;
   let infoRenderToken = 0;
   let modalCleanups = [];
+  let modalActiveTab = null;
   let sectionResizers = [];
   let shellResizeObserver = null;
   let observedShellWidth = 0;
@@ -1896,8 +1948,6 @@ function render({ model, el }) {
       errors.append(list);
       body.prepend(errors);
     }
-    const fields = document.createElement("div");
-    fields.className = "mt-modal__fields";
     const modalFields = current.fields || [];
 
     function fieldRow(field) {
@@ -1919,23 +1969,96 @@ function render({ model, el }) {
       return row;
     }
 
-    for (let index = 0; index < modalFields.length; index += 1) {
-      const field = modalFields[index];
-      const nextField = modalFields[index + 1];
-      const paired =
-        (field.kind === "color" && nextField?.kind === "line_width") ||
-        (field.kind === "opacity" && nextField?.kind === "dash");
-      if (paired) {
-        const pair = document.createElement("div");
-        pair.className = "mt-field-row-pair";
-        pair.append(fieldRow(field), fieldRow(nextField));
-        fields.append(pair);
-        index += 1;
-        continue;
+    function appendFieldRows(container, groupFields) {
+      for (let index = 0; index < groupFields.length; index += 1) {
+        const field = groupFields[index];
+        const nextField = groupFields[index + 1];
+        const thirdField = groupFields[index + 2];
+        const clustered =
+          field.id === "minimum" &&
+          nextField?.id === "maximum" &&
+          thirdField?.id === "step";
+        if (clustered) {
+          const cluster = document.createElement("div");
+          cluster.className = "mt-field-row-cluster";
+          cluster.append(fieldRow(field), fieldRow(nextField), fieldRow(thirdField));
+          container.append(cluster);
+          index += 2;
+          continue;
+        }
+        const paired =
+          (field.kind === "color" && nextField?.kind === "line_width") ||
+          (field.kind === "opacity" && nextField?.kind === "dash");
+        if (paired) {
+          const pair = document.createElement("div");
+          pair.className = "mt-field-row-pair";
+          pair.append(fieldRow(field), fieldRow(nextField));
+          container.append(pair);
+          index += 1;
+          continue;
+        }
+        container.append(fieldRow(field));
       }
-      fields.append(fieldRow(field));
     }
-    body.append(fields);
+
+    const groups = [];
+    for (const field of modalFields) {
+      const name = field.group || "General";
+      let group = groups.find((candidate) => candidate.name === name);
+      if (!group) {
+        group = { name, fields: [] };
+        groups.push(group);
+      }
+      group.fields.push(field);
+    }
+    if (!groups.some((group) => group.name === modalActiveTab)) {
+      modalActiveTab = groups[0]?.name || null;
+    }
+
+    const tabs = document.createElement("div");
+    tabs.className = "mt-modal__tabs";
+    const tablist = document.createElement("div");
+    tablist.className = "mt-modal__tablist";
+    tablist.setAttribute("role", "tablist");
+    const panelByGroup = new Map();
+
+    for (let index = 0; index < groups.length; index += 1) {
+      const group = groups[index];
+      const tabId = `mt-modal-tab-${generationId}-${index}`;
+      const panelId = `mt-modal-panel-${generationId}-${index}`;
+      const selected = group.name === modalActiveTab;
+      const tab = document.createElement("button");
+      tab.type = "button";
+      tab.className = "mt-modal__tab";
+      tab.id = tabId;
+      tab.textContent = group.name;
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-controls", panelId);
+      tab.setAttribute("aria-selected", selected ? "true" : "false");
+      tab.addEventListener("click", () => {
+        modalActiveTab = group.name;
+        for (const button of tablist.querySelectorAll(".mt-modal__tab")) {
+          const isCurrent = button === tab;
+          button.setAttribute("aria-selected", isCurrent ? "true" : "false");
+        }
+        for (const [name, panel] of panelByGroup) {
+          panel.hidden = name !== modalActiveTab;
+        }
+      });
+      tablist.append(tab);
+
+      const panel = document.createElement("div");
+      panel.className = "mt-modal__tabpanel mt-modal__fields";
+      panel.id = panelId;
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", tabId);
+      panel.hidden = !selected;
+      appendFieldRows(panel, group.fields);
+      panelByGroup.set(group.name, panel);
+    }
+
+    tabs.append(tablist, ...panelByGroup.values());
+    body.append(tabs);
     const footer = document.createElement("div");
     footer.className = "mt-modal__footer";
     const cancel = document.createElement("button");

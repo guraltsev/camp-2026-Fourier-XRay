@@ -35,11 +35,6 @@ try:  # SciPy is an optional runtime dependency until an Integral is evaluated.
 except Exception:  # pragma: no cover - exercised only in environments sans SciPy.
     _scipy_integrate = None
 
-try:  # SciPy is an optional runtime dependency until an infinity norm is evaluated.
-    import scipy.optimize as _scipy_optimize
-except Exception:  # pragma: no cover - exercised only in environments sans SciPy.
-    _scipy_optimize = None
-
 from .legacy._disabled import (
     NumArgumentError,
     NumUnsupportedExpressionError,
@@ -1471,11 +1466,6 @@ def _compile_essential_supremum(
         )
 
     domain_bounds = _infinity_norm_domain_bounds(node.variables, node.domain)
-    if len(domain_bounds) > 1 and _scipy_optimize is None:
-        raise NumUnsupportedExpressionError(
-            "I ran into a part of your expression I don't know how to convert: LinftyNorm. "
-            "You didn't do anything wrong! Multidimensional numerical infinity norms require SciPy."
-        )
     objective_arg_specs = _infinity_norm_objective_arg_specs(node.variables, ctx.arg_specs)
     objective = ctx.compiler.compile(
         node.expr,
@@ -1534,8 +1524,6 @@ def _compile_essential_supremum(
                 bound_names,
                 env,
                 symbol_to_name,
-                node.expr,
-                node.variables,
                 ctx.hints,
             )
 
@@ -1558,8 +1546,6 @@ def _compile_essential_supremum(
                 bound_names,
                 point_env,
                 symbol_to_name,
-                node.expr,
-                node.variables,
                 ctx.hints,
             )
         return result
@@ -1630,11 +1616,9 @@ def _evaluate_infinity_norm_scalar(
     bound_names: list[str],
     env: Mapping[sympy.Symbol, Any],
     symbol_to_name: Mapping[sympy.Symbol, str],
-    objective_expression: sympy.Basic,
-    variables: tuple[sympy.Symbol, ...],
     hints: Mapping[str, Any],
 ) -> float:
-    """Evaluate one scalar-parameter numerical infinity norm."""
+    """Evaluate one scalar-parameter numerical infinity norm by uniform sampling."""
     external_kwargs = {
         symbol_to_name[symbol]: value
         for symbol, value in env.items()
@@ -1651,77 +1635,45 @@ def _evaluate_infinity_norm_scalar(
         if upper < lower:
             raise NumEvaluationError("Infinity norm domain bounds must be ordered.")
 
-    def value_at(point: np.ndarray | tuple[float, ...]) -> float:
-        point_values = np.asarray(point, dtype=float).reshape(-1)
-        kwargs = dict(external_kwargs)
-        for name, value in zip(bound_names, point_values):
-            kwargs[name] = float(value)
-        return _finite_float(objective(**kwargs))
-
-    # Sample the interval directly first. This is deliberately plain NumPy
-    # sampling because symbolic expressions may have jumps that a smooth black
-    # box optimizer can miss without reporting a failure.
-    samples = [np.array([(lower + upper) / 2 for lower, upper in bounds], dtype=float)]
-    for corner_bits in np.ndindex(*(2 for _ in bounds)):
-        samples.append(
-            np.array(
-                [bounds[axis][bit] for axis, bit in enumerate(corner_bits)],
-                dtype=float,
-            )
-        )
-    samples.extend(_piecewise_boundary_probe_points(objective_expression, variables, bounds))
-    best = max(value_at(sample) for sample in samples)
-    if len(bounds) == 1:
-        best = max(
-            best,
-            _evaluate_infinity_norm_grid(
-                objective,
-                bound_names,
-                external_kwargs,
-                bounds[0],
-                _infinity_norm_sample_count(hints),
-            ),
-        )
-
-    def objective_to_minimize(point: np.ndarray | float) -> float:
-        point_array = np.asarray(point, dtype=float).reshape(-1)
-        return -value_at(point_array)
-
-    if len(bounds) == 1 and _scipy_optimize is not None:
-        lower, upper = bounds[0]
-        result = _scipy_optimize.minimize_scalar(
-            lambda value: objective_to_minimize(np.array([value])),
-            bounds=(lower, upper),
-            method="bounded",
-        )
-        if result.success:
-            best = max(best, -_finite_float(result.fun))
-    elif len(bounds) > 1:
-        result = _scipy_optimize.differential_evolution(
-            objective_to_minimize,
-            bounds=bounds,
-            polish=True,
-            seed=0,
-        )
-        if result.success:
-            best = max(best, -_finite_float(result.fun))
-
-    return float(best)
+    return _evaluate_infinity_norm_grid(
+        objective,
+        bound_names,
+        external_kwargs,
+        bounds,
+        _infinity_norm_sample_count(hints),
+    )
 
 
 def _evaluate_infinity_norm_grid(
     objective: NumFunction,
     bound_names: list[str],
     external_kwargs: Mapping[str, Any],
-    bounds: tuple[float, float],
+    bounds: tuple[tuple[float, float], ...],
     sample_count: int,
 ) -> float:
-    """Return the maximum over a dense one-dimensional uniform sample."""
+    """Return the maximum over a uniform grid of the bounded domain."""
 
-    lower, upper = bounds
-    samples = np.linspace(lower, upper, sample_count, dtype=float)
+    if len(bounds) == 1:
+        lower, upper = bounds[0]
+        samples = np.linspace(lower, upper, sample_count, dtype=float)
+        kwargs = dict(external_kwargs)
+        kwargs[bound_names[0]] = samples
+        values = np.asarray(objective(**kwargs), dtype=float)
+        if values.shape == ():
+            return _finite_float(values)
+        if not np.all(np.isfinite(values)):
+            raise NumEvaluationError("The numerical integrand produced a non-finite value.")
+        return float(np.max(values))
+
+    axis_count = _infinity_norm_axis_sample_count(sample_count, len(bounds))
+    axes = [
+        np.linspace(lower, upper, axis_count, dtype=float)
+        for lower, upper in bounds
+    ]
+    grids = np.meshgrid(*axes, indexing="ij")
     kwargs = dict(external_kwargs)
-    kwargs[bound_names[0]] = samples
+    for name, grid in zip(bound_names, grids, strict=True):
+        kwargs[name] = grid
     values = np.asarray(objective(**kwargs), dtype=float)
     if values.shape == ():
         return _finite_float(values)
@@ -1744,85 +1696,14 @@ def _infinity_norm_sample_count(hints: Mapping[str, Any]) -> int:
     return sample_count
 
 
-def _piecewise_boundary_probe_points(
-    expression: sympy.Basic,
-    variables: tuple[sympy.Symbol, ...],
-    bounds: tuple[tuple[float, float], ...],
-) -> list[np.ndarray]:
-    """Return one-sided sample points near finite one-dimensional Piecewise jumps."""
+def _infinity_norm_axis_sample_count(sample_count: int, dimensions: int) -> int:
+    """Return the per-axis sample count for a multidimensional uniform grid."""
 
-    if len(variables) != 1 or len(bounds) != 1:
-        return []
-
-    variable = variables[0]
-    lower, upper = bounds[0]
-    span = upper - lower
-    if not np.isfinite(span) or span <= 0:
-        return []
-
-    candidates: set[float] = set()
-    for node in sympy.preorder_traversal(expression):
-        if not isinstance(node, sympy.Piecewise):
-            continue
-        for _branch_expression, condition in node.args:
-            candidates.update(_condition_boundary_values(condition, variable))
-
-    epsilon = max(abs(span) * 1e-8, 1e-12)
-    points: list[np.ndarray] = []
-    seen: set[float] = set()
-    for candidate in sorted(candidates):
-        if not np.isfinite(candidate):
-            continue
-        for value in (candidate - epsilon, candidate, candidate + epsilon):
-            if value < lower or value > upper:
-                continue
-            if value in seen:
-                continue
-            seen.add(value)
-            points.append(np.array([value], dtype=float))
-    return points
-
-
-def _condition_boundary_values(condition: sympy.Basic, variable: sympy.Symbol) -> set[float]:
-    """Return finite scalar boundaries that can change one Piecewise condition."""
-
-    if condition in (sympy.true, sympy.false):
-        return set()
-
-    relation_type = sympy.core.relational.Relational
-    if isinstance(condition, relation_type):
-        return _relation_boundary_values(condition, variable)
-
-    values: set[float] = set()
-    for child in getattr(condition, "args", ()):
-        if isinstance(child, sympy.Basic):
-            values.update(_condition_boundary_values(child, variable))
-    return values
-
-
-def _relation_boundary_values(condition: sympy.Basic, variable: sympy.Symbol) -> set[float]:
-    """Return finite roots of one relation boundary in a Piecewise condition."""
-
-    if variable not in getattr(condition, "free_symbols", set()):
-        return set()
-
-    try:
-        boundary_expression = sympy.sympify(condition.lhs - condition.rhs)
-        roots = sympy.solve(boundary_expression, variable)
-    except Exception:
-        return set()
-
-    values: set[float] = set()
-    for root in roots:
-        if getattr(root, "free_symbols", set()):
-            continue
-        try:
-            value = _constant_expression_to_float(root)
-        except Exception:
-            continue
-        if np.isfinite(value):
-            values.add(float(value))
-    return values
+    axis_count = int(np.floor(sample_count ** (1 / max(dimensions, 1))))
+    axis_count = max(axis_count, 3)
+    if axis_count % 2 == 0:
+        axis_count += 1
+    return axis_count
 
 
 def _num_function_kwargs(function: NumFunction, values: Mapping[str, Any]) -> dict[str, Any]:

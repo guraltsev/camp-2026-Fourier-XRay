@@ -14,7 +14,13 @@ from .shell import FigureShellWidget
 from .host import AnywidgetHostAdapter, create_host_adapter
 
 if TYPE_CHECKING:
-    from ..model import ControlLayoutItem, InfoCardSnapshot, LegendItem, SliderValueItem
+    from ..model import (
+        ControlLayoutItem,
+        InfoCardSnapshot,
+        LegendItem,
+        ParameterAnimationStateItem,
+        SliderValueItem,
+    )
     from ..display import FigureDisplayGeneration
 
 __all__ = [
@@ -134,6 +140,14 @@ class AnywidgetFrontendBackend:
         """Publish parameter value payloads."""
 
         self.controls.sync_values(values)
+
+    def sync_animation_state(
+        self,
+        values: tuple[ParameterAnimationStateItem, ...],
+    ) -> None:
+        """Publish parameter animation-state payloads."""
+
+        self.controls.sync_animation_state(values)
 
     def reconcile_legend(self, items: tuple[LegendItem, ...]) -> None:
         """Publish legend row payloads."""

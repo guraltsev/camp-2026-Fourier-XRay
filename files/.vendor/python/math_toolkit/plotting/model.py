@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from itertools import count
 from pathlib import PurePosixPath
 import math
 import sys
+import time
 from types import MappingProxyType
+from typing import Callable, Iterator
 
 import numpy as np
 import sympy
 
 from math_toolkit.num import indexed_runtime_parameter_info
 
-from ._reactive import Computed, Effect, Signal, batch
+from ._reactive import Computed, Effect, Signal, batch, untracked
 from .display import (
     FigureDisplayGeneration,
     current_execution_key,
@@ -45,8 +49,11 @@ from .specs import (
     AxisView,
     CartesianView2D,
     CurveView,
+    DEFAULT_ANIMATION_SPEED,
     DomainConditionSpec,
     ListView,
+    ParameterAnimationMode,
+    ParameterAnimationSpeedDefault,
     ParameterMetadata,
     ParameterSpec,
     ParametricView,
@@ -75,6 +82,9 @@ from .specs import (
     normalize_sample_count,
     normalize_style,
     sort_symbols,
+    _parameter_animation_mode,
+    _parameter_animation_rate,
+    _parameter_animation_speed,
 )
 
 # Default plot colors are model state so toolkit-owned legends and Plotly
@@ -171,6 +181,11 @@ class ControlLayoutItem:
     minimum: float
     maximum: float
     step: float
+    animated: bool = True
+    animation_mode: str = "bounce"
+    animation_rate_hz: float = 20.0
+    animation_speed: str | float = "default"
+    animation_speed_effective: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -180,6 +195,16 @@ class SliderValueItem:
     node_id: int
     symbol: sympy.Symbol
     value: float
+
+
+@dataclass(frozen=True)
+class ParameterAnimationStateItem:
+    """Describe Python-owned play state for one parameter animation."""
+
+    symbol: sympy.Basic
+    running: bool
+    direction: int
+    accumulated_value_delta: float
 
 
 @dataclass(frozen=True)
@@ -669,13 +694,339 @@ class FigureView:
         return self._figure._reset_view(target)
 
 
+@dataclass
+class RunningParameterAnimation:
+    """Track transient play state for one running parameter."""
+
+    direction: int
+    previous_time: float
+    next_due_time: float
+    accumulated_value_delta: float = 0.0
+
+
+class AnimationScheduler:
+    """Run a cancellable notebook-friendly animation heartbeat."""
+
+    def __init__(self) -> None:
+        """Create an idle scheduler."""
+
+        self._task: object | None = None
+
+    @property
+    def running(self) -> bool:
+        """Return whether a scheduler task is active."""
+
+        task = self._task
+        return task is not None and not task.done()
+
+    def start(self, tick: Callable[[], None]) -> bool:
+        """Start a 60Hz task and return whether it could be scheduled."""
+
+        if self.running:
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        async def _run() -> None:
+            while True:
+                tick()
+                await asyncio.sleep(1.0 / 60.0)
+
+        self._task = loop.create_task(_run())
+        return True
+
+    def stop(self) -> None:
+        """Cancel the active task if one exists."""
+
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+
+class FigureAnimationCoordinator:
+    """Own Python-side parameter animation state for one figure."""
+
+    def __init__(
+        self,
+        figure: FigureHandle,
+        *,
+        scheduler: AnimationScheduler | None = None,
+        monotonic: Callable[[], float] | None = None,
+    ) -> None:
+        """Create an idle coordinator for figure-owned parameters."""
+
+        self._figure = figure
+        self._scheduler = AnimationScheduler() if scheduler is None else scheduler
+        self._monotonic = time.monotonic if monotonic is None else monotonic
+        self._running: dict[sympy.Basic, RunningParameterAnimation] = {}
+        self._animation_write_depth = 0
+
+    @contextmanager
+    def animation_value_write(self) -> Iterator[None]:
+        """Mark parameter value writes that originate from animation ticks."""
+
+        self._animation_write_depth += 1
+        try:
+            yield
+        finally:
+            self._animation_write_depth -= 1
+
+    @property
+    def writing_animation_value(self) -> bool:
+        """Return whether the coordinator is applying its own value write."""
+
+        return self._animation_write_depth > 0
+
+    @property
+    def running_symbols(self) -> frozenset[sympy.Basic]:
+        """Return symbols that currently have running animations."""
+
+        return frozenset(self._running)
+
+    def play(self, symbol: sympy.Basic) -> None:
+        """Start animation for one parameter if its metadata allows it."""
+
+        state = self._figure.parameters.get(symbol)
+        if state is None or not state.animated:
+            self.stop(symbol)
+            return
+        metadata = state.metadata
+        if metadata.minimum == metadata.maximum:
+            return
+
+        if metadata.animation_mode == ParameterAnimationMode.FORWARD:
+            threshold = metadata.maximum - 2.0 * metadata.step
+            if state.value >= threshold:
+                default_value = self._figure._default_parameter_value(symbol)
+                if default_value is not None:
+                    with self.animation_value_write():
+                        state.set_value(default_value)
+
+        now = self._monotonic()
+        self._running[symbol] = RunningParameterAnimation(
+            direction=1,
+            previous_time=now,
+            next_due_time=now,
+        )
+        if not self._scheduler.running:
+            started = self._scheduler.start(self.tick)
+            if not started:
+                self._running.pop(symbol, None)
+                self._figure._queue_output_notice(
+                    "Parameter animation is unavailable because no running Python event loop was found."
+                )
+        self._publish_state()
+
+    def pause(self, symbol: sympy.Basic) -> None:
+        """Pause one parameter animation."""
+
+        if symbol in self._running:
+            del self._running[symbol]
+            self._stop_scheduler_if_idle()
+            self._publish_state()
+
+    def stop(self, symbol: sympy.Basic) -> None:
+        """Stop one parameter animation and discard its accumulator."""
+
+        self.pause(symbol)
+
+    def stop_all(self) -> None:
+        """Stop every running animation."""
+
+        if not self._running:
+            return
+        self._running.clear()
+        self._scheduler.stop()
+        self._publish_state()
+
+    def toggle(self, symbol: sympy.Basic) -> None:
+        """Toggle one parameter between running and paused."""
+
+        if symbol in self._running:
+            self.pause(symbol)
+        else:
+            self.play(symbol)
+
+    def notify_external_value_write(self, symbol: sympy.Basic) -> None:
+        """Stop a running animation after a non-animation value write."""
+
+        if not self.writing_animation_value:
+            self.stop(symbol)
+
+    def notify_metadata_write(self, symbol: sympy.Basic, *, clamped_value: bool = True) -> None:
+        """Stop a running animation after metadata changes that affect playback."""
+
+        if clamped_value or symbol in self._running:
+            self.stop(symbol)
+
+    def snapshot(self) -> tuple[ParameterAnimationStateItem, ...]:
+        """Return current play state for active figure parameters."""
+
+        items: list[ParameterAnimationStateItem] = []
+        for symbol in self._figure._ordered_active_parameter_symbols():
+            running = self._running.get(symbol)
+            items.append(
+                ParameterAnimationStateItem(
+                    symbol=symbol,
+                    running=running is not None,
+                    direction=1 if running is None else running.direction,
+                    accumulated_value_delta=(
+                        0.0 if running is None else running.accumulated_value_delta
+                    ),
+                )
+            )
+        return tuple(items)
+
+    def tick(self) -> None:
+        """Advance due animations using the coordinator's monotonic clock."""
+
+        self.tick_at(self._monotonic())
+
+    def tick_at(self, now: float) -> None:
+        """Advance due animations for deterministic tests and scheduler wakes."""
+
+        for symbol in tuple(self._running):
+            running = self._running.get(symbol)
+            state = self._figure.parameters.get(symbol)
+            if running is None or state is None or not state.animated:
+                self.stop(symbol)
+                continue
+            if now + 1e-12 < running.next_due_time:
+                continue
+            self._tick_symbol(symbol, state, running, float(now))
+        self._stop_scheduler_if_idle()
+        self._publish_state()
+
+    def _tick_symbol(
+        self,
+        symbol: sympy.Basic,
+        state: ParameterState,
+        running: RunningParameterAnimation,
+        now: float,
+    ) -> None:
+        """Advance one parameter by elapsed wall-clock motion."""
+
+        metadata = state.metadata
+        elapsed = max(0.0, now - running.previous_time)
+        running.previous_time = now
+        running.next_due_time = now + 1.0 / metadata.animation_rate_hz
+
+        running.accumulated_value_delta += (
+            running.direction * metadata.animation_speed_effective * elapsed
+        )
+        step = metadata.step
+        if abs(running.accumulated_value_delta) < step:
+            return
+
+        whole_steps = math.trunc(abs(running.accumulated_value_delta) / step)
+        applied_delta = math.copysign(whole_steps * step, running.accumulated_value_delta)
+        running.accumulated_value_delta -= applied_delta
+        candidate = state.value + applied_delta
+        value, direction, keep_running = self._apply_mode(candidate, metadata, running.direction)
+        running.direction = direction
+        if not keep_running:
+            self._running.pop(symbol, None)
+        with self.animation_value_write():
+            state.set_value(value)
+
+    def _apply_mode(
+        self,
+        candidate: float,
+        metadata: ParameterMetadata,
+        direction: int,
+    ) -> tuple[float, int, bool]:
+        """Return a range-constrained value and next direction."""
+
+        minimum = metadata.minimum
+        maximum = metadata.maximum
+        width = maximum - minimum
+        if width <= 0:
+            return minimum, direction, False
+        if metadata.animation_mode == ParameterAnimationMode.FORWARD:
+            if candidate >= maximum:
+                return maximum, direction, False
+            return max(minimum, candidate), direction, True
+        if metadata.animation_mode == ParameterAnimationMode.WRAP:
+            while candidate > maximum:
+                candidate = minimum + (candidate - maximum)
+            while candidate < minimum:
+                candidate = maximum - (minimum - candidate)
+            return candidate, direction, True
+
+        doubled = 2.0 * width
+        position = (candidate - minimum) % doubled
+        if position <= width:
+            return minimum + position, 1, True
+        return maximum - (position - width), -1, True
+
+    def _stop_scheduler_if_idle(self) -> None:
+        """Stop the heartbeat when no parameter is running."""
+
+        if not self._running:
+            self._scheduler.stop()
+
+    def _publish_state(self) -> None:
+        """Publish play-state changes to the active frontend."""
+
+        self._figure.sync_animation_state(self.snapshot())
+
+
+class ParameterAnimationControl:
+    """Expose animation commands for one figure parameter."""
+
+    def __init__(self, state: ParameterState) -> None:
+        """Create a parameter-scoped animation command object."""
+
+        self._state = state
+
+    @property
+    def enabled(self) -> bool:
+        """Return whether animation controls are enabled for this parameter."""
+
+        return self._state.animated
+
+    @enabled.setter
+    def enabled(self, value: object) -> None:
+        """Enable or disable animation controls for this parameter."""
+
+        self._state.animated = value
+
+    @property
+    def running(self) -> bool:
+        """Return whether this parameter is currently animating."""
+
+        return self._state.symbol in self._state._figure._animation_coordinator.running_symbols
+
+    def start(self) -> None:
+        """Start this parameter's animation."""
+
+        self._state._figure._animation_coordinator.play(self._state.symbol)
+
+    def stop(self) -> None:
+        """Stop this parameter's animation."""
+
+        self._state._figure._animation_coordinator.stop(self._state.symbol)
+
+    def toggle(self) -> None:
+        """Toggle this parameter's animation."""
+
+        self._state._figure._animation_coordinator.toggle(self._state.symbol)
+
+
 class ParameterState:
     """Own signal-backed value and metadata for one plot parameter."""
 
-    def __init__(self, spec: ParameterSpec) -> None:
+    __slots__ = ("_figure", "animate", "metadata_signal", "symbol", "value_signal")
+
+    def __init__(self, figure: FigureHandle, spec: ParameterSpec) -> None:
         """Create parameter state from a normalized public spec."""
 
+        self._figure = figure
         self.symbol = spec.symbol
+        self.animate = ParameterAnimationControl(self)
         self.value_signal = Signal(float(spec.value), equal=_semantic_equal)
         self.metadata_signal = Signal(spec.metadata, equal=_semantic_equal)
 
@@ -685,15 +1036,137 @@ class ParameterState:
 
         return self.value_signal()
 
+    @value.setter
+    def value(self, value: object) -> None:
+        """Set the current slider value."""
+
+        self._figure._set_parameter_field(self.symbol, "value", value)
+
     @property
     def metadata(self) -> ParameterMetadata:
         """Return the current slider metadata."""
 
         return self.metadata_signal()
 
+    @property
+    def min(self) -> float:
+        """Return the current slider minimum."""
+
+        return self.metadata.minimum
+
+    @min.setter
+    def min(self, value: object) -> None:
+        """Set the current slider minimum."""
+
+        self._figure._set_parameter_field(self.symbol, "min", value)
+
+    @property
+    def max(self) -> float:
+        """Return the current slider maximum."""
+
+        return self.metadata.maximum
+
+    @max.setter
+    def max(self, value: object) -> None:
+        """Set the current slider maximum."""
+
+        self._figure._set_parameter_field(self.symbol, "max", value)
+
+    @property
+    def range(self) -> tuple[float, float, float]:
+        """Return the current slider minimum, maximum, and step."""
+
+        metadata = self.metadata
+        return (metadata.minimum, metadata.maximum, metadata.step)
+
+    @range.setter
+    def range(self, value: object) -> None:
+        """Set the slider range from ``(min, max)`` or ``(min, max, step)``."""
+
+        self._figure._set_parameter_range(self.symbol, value)
+
+    @property
+    def step(self) -> float:
+        """Return the current slider step."""
+
+        return self.metadata.step
+
+    @step.setter
+    def step(self, value: object) -> None:
+        """Set the current slider step."""
+
+        self._figure._set_parameter_field(self.symbol, "step", value)
+
+    @property
+    def label(self) -> str | None:
+        """Return the current slider label."""
+
+        return self.metadata.label
+
+    @label.setter
+    def label(self, value: object) -> None:
+        """Set the current slider label."""
+
+        self._figure._set_parameter_field(self.symbol, "label", value)
+
+    @property
+    def animated(self) -> bool:
+        """Return whether this parameter exposes animation controls."""
+
+        return self.metadata.animated
+
+    @animated.setter
+    def animated(self, value: object) -> None:
+        """Set whether this parameter exposes animation controls."""
+
+        self._figure._set_parameter_field(self.symbol, "animated", value)
+
+    @property
+    def animation_mode(self) -> str:
+        """Return the stored animation boundary mode."""
+
+        return self.metadata.animation_mode.value
+
+    @animation_mode.setter
+    def animation_mode(self, value: object) -> None:
+        """Set the stored animation boundary mode."""
+
+        self._figure._set_parameter_field(self.symbol, "animation_mode", value)
+
+    @property
+    def animation_rate_hz(self) -> float:
+        """Return the animation recomputation cadence."""
+
+        return self.metadata.animation_rate_hz
+
+    @animation_rate_hz.setter
+    def animation_rate_hz(self, value: object) -> None:
+        """Set the animation recomputation cadence."""
+
+        self._figure._set_parameter_field(self.symbol, "animation_rate_hz", value)
+
+    @property
+    def animation_speed(self) -> float | ParameterAnimationSpeedDefault:
+        """Return the stored animation speed setting."""
+
+        return self.metadata.animation_speed
+
+    @animation_speed.setter
+    def animation_speed(self, value: object) -> None:
+        """Set the stored animation speed setting."""
+
+        self._figure._set_parameter_field(self.symbol, "animation_speed", value)
+
+    @property
+    def animation_speed_effective(self) -> float:
+        """Return the concrete animation speed after applying defaults."""
+
+        return self.metadata.animation_speed_effective
+
     def set_value(self, value: object) -> None:
         """Set the numeric parameter value from a widget or handle call."""
 
+        self._figure._animation_coordinator.notify_external_value_write(self.symbol)
         self.value_signal.set(float(value))
 
     def set_spec(self, spec: ParameterSpec) -> None:
@@ -710,6 +1183,230 @@ class ParameterState:
             value=self.value,
             metadata=self.metadata,
         )
+
+
+class PendingParameterState:
+    """Create a new figure parameter from the first direct assignment."""
+
+    __slots__ = ("_figure", "symbol")
+
+    def __init__(self, figure: FigureHandle, symbol: sympy.Basic) -> None:
+        """Create a pending parameter entry for one supported symbol."""
+
+        self._figure = figure
+        self.symbol = symbol
+
+    @property
+    def value(self) -> float:
+        """Raise because a pending parameter has no value yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @value.setter
+    def value(self, value: object) -> None:
+        """Create the parameter with a value-centered default range."""
+
+        number = self._figure._finite_parameter_float(value, "value")
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=number,
+                metadata=ParameterMetadata(
+                    minimum=number - 1.0,
+                    maximum=number + 1.0,
+                    step=0.01,
+                    label=None,
+                ),
+            )
+        )
+
+    @property
+    def min(self) -> float:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @min.setter
+    def min(self, value: object) -> None:
+        """Create the parameter from its first slider minimum."""
+
+        minimum = self._figure._finite_parameter_float(value, "minimum")
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=minimum + 1.0,
+                metadata=ParameterMetadata(
+                    minimum=minimum,
+                    maximum=minimum + 2.0,
+                    step=0.01,
+                    label=None,
+                ),
+            )
+        )
+
+    @property
+    def max(self) -> float:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @max.setter
+    def max(self, value: object) -> None:
+        """Create the parameter from its first slider maximum."""
+
+        maximum = self._figure._finite_parameter_float(value, "maximum")
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=maximum - 1.0,
+                metadata=ParameterMetadata(
+                    minimum=maximum - 2.0,
+                    maximum=maximum,
+                    step=0.01,
+                    label=None,
+                ),
+            )
+        )
+
+    @property
+    def range(self) -> tuple[float, float, float]:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @range.setter
+    def range(self, value: object) -> None:
+        """Create the parameter from its first slider range."""
+
+        minimum, maximum, step = self._figure._parameter_range_parts(
+            value,
+            default_step=0.01,
+        )
+        if minimum > maximum:
+            raise PlotSpecError("Parameter slider minimum must not exceed maximum.")
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=(minimum + maximum) / 2.0,
+                metadata=ParameterMetadata(
+                    minimum=minimum,
+                    maximum=maximum,
+                    step=step,
+                    label=None,
+                ),
+            )
+        )
+
+    @property
+    def step(self) -> float:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @step.setter
+    def step(self, value: object) -> None:
+        """Create a default parameter with a custom slider step."""
+
+        step = self._figure._positive_parameter_float(value, "step")
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=0.0,
+                metadata=ParameterMetadata(
+                    minimum=-1.0,
+                    maximum=1.0,
+                    step=step,
+                    label=None,
+                ),
+            )
+        )
+
+    @property
+    def label(self) -> str | None:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @label.setter
+    def label(self, value: object) -> None:
+        """Create a default parameter with a custom slider label."""
+
+        self._figure._explicit_parameter_definitions.add(self.symbol)
+        self._figure._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=self.symbol,
+                value=0.0,
+                metadata=ParameterMetadata(
+                    minimum=-1.0,
+                    maximum=1.0,
+                    step=0.01,
+                    label=None if value is None else str(value),
+                ),
+            )
+        )
+
+    @property
+    def animated(self) -> bool:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @animated.setter
+    def animated(self, value: object) -> None:
+        """Create a default parameter with a custom animation flag."""
+
+        self.value = 0.0
+        self._figure._set_parameter_field(self.symbol, "animated", value)
+
+    @property
+    def animation_mode(self) -> str:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @animation_mode.setter
+    def animation_mode(self, value: object) -> None:
+        """Create a default parameter with a custom animation mode."""
+
+        self.value = 0.0
+        self._figure._set_parameter_field(self.symbol, "animation_mode", value)
+
+    @property
+    def animation_rate_hz(self) -> float:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @animation_rate_hz.setter
+    def animation_rate_hz(self, value: object) -> None:
+        """Create a default parameter with a custom animation rate."""
+
+        self.value = 0.0
+        self._figure._set_parameter_field(self.symbol, "animation_rate_hz", value)
+
+    @property
+    def animation_speed(self) -> float | ParameterAnimationSpeedDefault:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
+
+    @animation_speed.setter
+    def animation_speed(self, value: object) -> None:
+        """Create a default parameter with a custom animation speed."""
+
+        self.value = 0.0
+        self._figure._set_parameter_field(self.symbol, "animation_speed", value)
+
+    @property
+    def animation_speed_effective(self) -> float:
+        """Raise because a pending parameter has no metadata yet."""
+
+        raise PlotSpecError("Parameter has not been assigned yet.")
 
 
 class FigureParameters:
@@ -780,15 +1477,18 @@ class FigureParameters:
 
         return self._figure._define_parameters(params)
 
-    def __getitem__(self, symbol: sympy.Basic) -> ParameterState:
+    def __getitem__(self, symbol: sympy.Basic) -> ParameterState | PendingParameterState:
         """Return live state for one active or predefined parameter."""
 
-        return self._figure._parameters[symbol]
+        return self._figure._parameter_entry(symbol)
 
     def __contains__(self, symbol: object) -> bool:
         """Return whether a parameter symbol exists on the figure."""
 
-        return symbol in self._figure._parameters
+        return (
+            symbol in self._figure._parameters
+            or symbol in self._figure._parameter_definitions
+        )
 
     def __iter__(self) -> object:
         """Iterate over figure-owned parameter symbols."""
@@ -803,7 +1503,9 @@ class FigureParameters:
     def get(self, symbol: sympy.Basic, default: object = None) -> object:
         """Return live state for one parameter or a default value."""
 
-        return self._figure._parameters.get(symbol, default)
+        if symbol in self:
+            return self._figure._ensure_parameter_state(symbol)
+        return default
 
     def items(self) -> object:
         """Return parameter symbol and state pairs."""
@@ -991,7 +1693,7 @@ class InfoCard:
         """Return normalized parameter spec snapshots for active parameters."""
 
         return {
-            symbol: state.to_spec()
+            symbol: self.figure._defaulted_parameter_spec(symbol, state)
             for symbol, state in self.parameters.items()
         }
 
@@ -1037,6 +1739,11 @@ class InfoCard:
                     metadata.maximum,
                     metadata.step,
                     metadata.label,
+                    metadata.animated,
+                    metadata.animation_mode.value,
+                    metadata.animation_rate_hz,
+                    _animation_speed_snapshot(metadata),
+                    metadata.animation_speed_effective,
                 )
             )
         return tuple(rows)
@@ -1218,7 +1925,8 @@ class PlotNode:
         self.figure = figure
         self.kind = kind
         self.name = name
-        self.expression_signal = Signal(expression, equal=_semantic_equal)
+        self.expression_signal = _quiet_signal(expression, equal=_semantic_equal)
+        self._expression_revision_signal = Signal(0)
         self.view_signal = Signal(view, equal=_semantic_equal)
         self.label_signal = Signal(label, equal=_semantic_equal)
         self.style_signal = Signal(dict(style), equal=_semantic_equal)
@@ -1314,7 +2022,8 @@ class PlotNode:
         """Update source state while preserving node identity and buffers."""
 
         with batch():
-            self.expression_signal.set(expression)
+            _quiet_signal_set(self.expression_signal, expression)
+            self._expression_revision_signal.update(lambda revision: revision + 1)
             self.view_signal.set(view)
             self.label_signal.set(label)
             self.style_signal.set(dict(style))
@@ -1485,7 +2194,7 @@ class PlotNode:
         """Return normalized parameter spec snapshots for active parameters."""
 
         return {
-            symbol: state.to_spec()
+            symbol: self.figure._defaulted_parameter_spec(symbol, state)
             for symbol, state in self.parameters.items()
         }
 
@@ -1528,8 +2237,14 @@ class PlotNode:
 
         symbols = self.parameter_symbols_signal()
         values = tuple(self.parameters[symbol].value_signal() for symbol in symbols)
+
+        # Track expression edits through a small revision signal. Reading the
+        # expression signal directly on every parameter tick forces reaktiv to
+        # format large SymPy expressions for debug logging even when logging is
+        # disabled, which can dominate interactive updates.
+        self._expression_revision_signal()
         return SampleSignature(
-            expression=self.expression_signal(),
+            expression=untracked(self.expression_signal),
             view=self.view_signal(),
             parameter_symbols=symbols,
             parameter_values=values,
@@ -1548,6 +2263,11 @@ class PlotNode:
                     metadata.maximum,
                     metadata.step,
                     metadata.label,
+                    metadata.animated,
+                    metadata.animation_mode.value,
+                    metadata.animation_rate_hz,
+                    _animation_speed_snapshot(metadata),
+                    metadata.animation_speed_effective,
                 )
             )
         return tuple(rows)
@@ -1814,8 +2534,11 @@ class FigureHandle:
         self.info_cards: list[InfoCard] = []
         self.info_cards_by_name: dict[str, InfoCard] = {}
         self._parameter_definitions: dict[sympy.Basic, ParameterSpec] = {}
+        self._explicit_parameter_definitions: set[sympy.Basic] = set()
         self._parameters: dict[sympy.Basic, ParameterState] = {}
         self.parameters = FigureParameters(self)
+        self.parameter = self.parameters
+        self._animation_coordinator = FigureAnimationCoordinator(self)
         self.views: list[ViewHandle] = []
         self.views_by_name: dict[str, ViewHandle] = {}
         self.view = FigureView(self)
@@ -1890,7 +2613,7 @@ class FigureHandle:
         output_context = self._output_area_context_stack.pop()
         try:
             if output_context is not None:
-                output_context.__exit__(exc_type, exc, traceback)
+                output_context.__exit__(None, None, None)
         finally:
             try:
                 get_session().pop_figure(self)
@@ -1960,12 +2683,20 @@ class FigureHandle:
         # caller assigns them back through this property or calls ``set_params``.
         params: dict[sympy.Symbol, dict[str, object]] = {}
         for symbol, spec in self._parameter_specs().items():
+            state = self._parameters.get(symbol)
             params[symbol] = {
                 "value": spec.value,
+                "default_value": spec.value,
+                "current_value": spec.value if state is None else state.value,
                 "min": spec.metadata.minimum,
                 "max": spec.metadata.maximum,
                 "step": spec.metadata.step,
                 "label": spec.metadata.label,
+                "animated": spec.metadata.animated,
+                "animation_mode": spec.metadata.animation_mode.value,
+                "animation_rate_hz": spec.metadata.animation_rate_hz,
+                "animation_speed": _animation_speed_snapshot(spec.metadata),
+                "animation_speed_effective": spec.metadata.animation_speed_effective,
             }
         return params
 
@@ -1997,6 +2728,7 @@ class FigureHandle:
             existing=self._parameter_specs(),
         )
         self._parameter_definitions.update(specs)
+        self._explicit_parameter_definitions.update(specs)
         pending_plots: list[tuple[PlotNode, dict[sympy.Basic, ParameterSpec]]] = []
         existing_specs = dict(self._parameter_definitions)
         existing_specs.update(self._parameter_specs())
@@ -2031,6 +2763,8 @@ class FigureHandle:
             )
 
         updates: dict[sympy.Basic, object] = {}
+        current_value_updates: dict[sympy.Basic, object] = {}
+        preserve_current_symbols: set[sympy.Basic] = set()
         for symbol, raw_spec in params.items():
             if not isinstance(symbol, (sympy.Symbol, sympy.Indexed)):
                 raise PlotSpecError(
@@ -2041,7 +2775,46 @@ class FigureHandle:
                 raise PlotSpecError(
                     f"Figure has no active parameter named {symbol!s}."
                 )
-            updates[symbol] = raw_spec
+            if isinstance(raw_spec, Mapping):
+                unknown = set(raw_spec) - {
+                    "value",
+                    "default_value",
+                    "current_value",
+                    "min",
+                    "max",
+                    "step",
+                    "label",
+                    "animated",
+                    "animation_mode",
+                    "animation_rate_hz",
+                    "animation_speed",
+                }
+                if "animation_speed_effective" in raw_spec:
+                    raise PlotSpecError(
+                        "animation_speed_effective is read-only; assign animation_speed instead."
+                    )
+                if unknown:
+                    raise PlotSpecError(
+                        "Parameter specs must be supplied through fig.parameters({symbol: value}) "
+                        'or fig.parameters({symbol: {"value": ..., "min": ..., "max": ...}}).'
+                    )
+                if "value" in raw_spec and (
+                    "default_value" in raw_spec or "current_value" in raw_spec
+                ):
+                    raise PlotSpecError(
+                        "Parameter specs must use 'value' or split value fields, not both."
+                    )
+                if "current_value" in raw_spec:
+                    current_value_updates[symbol] = raw_spec["current_value"]
+                if "default_value" in raw_spec and "value" not in raw_spec:
+                    preserve_current_symbols.add(symbol)
+                updates[symbol] = {
+                    key: value
+                    for key, value in raw_spec.items()
+                    if key != "current_value"
+                }
+            else:
+                updates[symbol] = raw_spec
 
         pending_plots: list[tuple[PlotNode, dict[sympy.Basic, ParameterSpec]]] = []
         for node in self.plots:
@@ -2078,11 +2851,24 @@ class FigureHandle:
             )
             pending_info.append((card, specs))
 
+        preserved_current_values = {
+            symbol: self._parameters[symbol].value
+            for symbol in preserve_current_symbols
+            if symbol in self._parameters
+        }
         with batch():
             for node, specs in pending_plots:
                 node._set_parameter_specs(specs)
             for card, specs in pending_info:
                 card._set_parameter_specs(specs)
+            for symbol, value in preserved_current_values.items():
+                if symbol in self._parameters:
+                    self._parameters[symbol].set_value(value)
+            for symbol, value in current_value_updates.items():
+                if symbol in self._parameters:
+                    self._parameters[symbol].set_value(
+                        self._finite_parameter_float(value, "current value")
+                    )
         return self
 
     @property
@@ -2656,6 +3442,20 @@ class FigureHandle:
         if self._active_generation is not None:
             self._active_generation.sync_controls(values)
 
+    def sync_animation_state(
+        self,
+        values: tuple[ParameterAnimationStateItem, ...],
+    ) -> None:
+        """Synchronize existing animation buttons without rebuilding controls."""
+
+        if self._active_generation is not None:
+            self._active_generation.sync_animation_state(values)
+
+    def animation_state_snapshot(self) -> tuple[ParameterAnimationStateItem, ...]:
+        """Return the current figure-level animation play-state snapshot."""
+
+        return self._animation_coordinator.snapshot()
+
     def reconcile_legend(self) -> None:
         """Reconcile legend rows from the current plot snapshots."""
 
@@ -2668,7 +3468,18 @@ class FigureHandle:
         items: list[ControlLayoutItem] = []
         seen: set[sympy.Symbol] = set()
         for node in self.plots:
-            for symbol, minimum, maximum, step, label in node.controls_signature():
+            for (
+                symbol,
+                minimum,
+                maximum,
+                step,
+                label,
+                animated,
+                animation_mode,
+                animation_rate_hz,
+                animation_speed,
+                animation_speed_effective,
+            ) in node.controls_signature():
                 if symbol in seen:
                     continue
                 seen.add(symbol)
@@ -2680,10 +3491,26 @@ class FigureHandle:
                         minimum=minimum,
                         maximum=maximum,
                         step=step,
+                        animated=animated,
+                        animation_mode=animation_mode,
+                        animation_rate_hz=animation_rate_hz,
+                        animation_speed=animation_speed,
+                        animation_speed_effective=animation_speed_effective,
                     )
                 )
         for card in self.info_cards:
-            for symbol, minimum, maximum, step, label in card.controls_signature():
+            for (
+                symbol,
+                minimum,
+                maximum,
+                step,
+                label,
+                animated,
+                animation_mode,
+                animation_rate_hz,
+                animation_speed,
+                animation_speed_effective,
+            ) in card.controls_signature():
                 if symbol in seen:
                     continue
                 seen.add(symbol)
@@ -2695,6 +3522,11 @@ class FigureHandle:
                         minimum=minimum,
                         maximum=maximum,
                         step=step,
+                        animated=animated,
+                        animation_mode=animation_mode,
+                        animation_rate_hz=animation_rate_hz,
+                        animation_speed=animation_speed,
+                        animation_speed_effective=animation_speed_effective,
                     )
                 )
         return tuple(items)
@@ -2751,6 +3583,7 @@ class FigureHandle:
     def close(self) -> None:
         """Dispose effects and widget observers owned by this figure."""
 
+        self._animation_coordinator.stop_all()
         self._audio_controller.stop()
         for audio_node in tuple(self._audio_nodes.values()):
             dispose = getattr(audio_node, "dispose", None)
@@ -2769,6 +3602,7 @@ class FigureHandle:
         self.info_cards.clear()
         self.info_cards_by_name.clear()
         self._parameter_definitions.clear()
+        self._explicit_parameter_definitions.clear()
         self._parameters.clear()
         self.views.clear()
         self.views_by_name.clear()
@@ -3275,17 +4109,246 @@ class FigureHandle:
         self._parameter_definitions[spec.symbol] = spec
         state = self._parameters.get(spec.symbol)
         if state is None:
-            state = ParameterState(spec)
+            state = ParameterState(self, spec)
             self._parameters[spec.symbol] = state
         else:
+            previous_value = state.value
+            previous_metadata = state.metadata
             state.set_spec(spec)
+            if spec.value != previous_value:
+                self._animation_coordinator.notify_external_value_write(spec.symbol)
+            if _parameter_metadata_change_stops_animation(
+                previous_metadata,
+                spec.metadata,
+            ):
+                self._animation_coordinator.notify_metadata_write(spec.symbol)
         return state
+
+    def _set_parameter_default_spec(
+        self,
+        symbol: sympy.Basic,
+        default_value: object,
+        metadata: ParameterMetadata,
+    ) -> None:
+        """Update a parameter's reset value and metadata without moving its current value."""
+
+        state = self._ensure_parameter_state(symbol)
+        value = self._finite_parameter_float(default_value, "default value")
+        spec = ParameterSpec(symbol=symbol, value=value, metadata=metadata)
+        self._explicit_parameter_definitions.add(symbol)
+        self._parameter_definitions[symbol] = spec
+        previous_metadata = state.metadata
+        state.metadata_signal.set(metadata)
+        if _parameter_metadata_change_stops_animation(previous_metadata, metadata):
+            self._animation_coordinator.notify_metadata_write(symbol)
+
+    def _defaulted_parameter_spec(
+        self,
+        symbol: sympy.Basic,
+        state: ParameterState,
+    ) -> ParameterSpec:
+        """Return a spec using the declared reset value and current metadata."""
+
+        definition = self._parameter_definitions.get(symbol)
+        value = state.value if definition is None else definition.value
+        return ParameterSpec(symbol=symbol, value=value, metadata=state.metadata)
+
+    def _parameter_entry(
+        self,
+        symbol: sympy.Basic,
+    ) -> ParameterState | PendingParameterState:
+        """Return an existing parameter state or a pending direct-write entry."""
+
+        if not isinstance(symbol, (sympy.Symbol, sympy.Indexed)):
+            raise PlotSpecError(
+                "Parameter specs must be supplied through fig.parameters({symbol: value}) "
+                'or fig.parameters({symbol: {"value": ..., "min": ..., "max": ...}}).'
+            )
+        if symbol in self._parameters or symbol in self._parameter_definitions:
+            return self._ensure_parameter_state(symbol)
+        return PendingParameterState(self, symbol)
+
+    def _ensure_parameter_state(self, symbol: sympy.Basic) -> ParameterState:
+        """Return existing parameter state or instantiate a stored declaration."""
+
+        if not isinstance(symbol, (sympy.Symbol, sympy.Indexed)):
+            raise PlotSpecError(
+                "Parameter specs must be supplied through fig.parameters({symbol: value}) "
+                'or fig.parameters({symbol: {"value": ..., "min": ..., "max": ...}}).'
+            )
+        state = self._parameters.get(symbol)
+        if state is not None:
+            return state
+        spec = self._parameter_definitions.get(symbol)
+        if spec is None:
+            raise PlotSpecError("Parameter has not been assigned yet.")
+        return self._parameter_state_for_spec(spec)
+
+    def _set_parameter_field(
+        self,
+        symbol: sympy.Basic,
+        field: str,
+        raw_value: object,
+    ) -> None:
+        """Apply one direct parameter attribute update."""
+
+        state = self._ensure_parameter_state(symbol)
+        self._explicit_parameter_definitions.add(symbol)
+        spec = state.to_spec()
+        value = spec.value
+        minimum = spec.metadata.minimum
+        maximum = spec.metadata.maximum
+        step = spec.metadata.step
+        label = spec.metadata.label
+        animated = spec.metadata.animated
+        animation_mode = spec.metadata.animation_mode
+        animation_rate_hz = spec.metadata.animation_rate_hz
+        animation_speed = spec.metadata.animation_speed
+
+        if field == "value":
+            value = self._finite_parameter_float(raw_value, "value")
+            if value < minimum:
+                minimum = value
+            if value > maximum:
+                maximum = value
+        elif field == "min":
+            minimum = self._finite_parameter_float(raw_value, "minimum")
+            if minimum > maximum:
+                raise PlotSpecError("Parameter slider minimum must not exceed maximum.")
+            if value < minimum:
+                value = minimum
+        elif field == "max":
+            maximum = self._finite_parameter_float(raw_value, "maximum")
+            if maximum < minimum:
+                raise PlotSpecError("Parameter slider maximum must not be below minimum.")
+            if value > maximum:
+                value = maximum
+        elif field == "step":
+            step = self._positive_parameter_float(raw_value, "step")
+        elif field == "label":
+            label = None if raw_value is None else str(raw_value)
+        elif field == "animated":
+            if not isinstance(raw_value, bool):
+                raise PlotSpecError("Parameter animated must be True or False.")
+            animated = raw_value
+        elif field == "animation_mode":
+            animation_mode = _parameter_animation_mode(raw_value)
+        elif field == "animation_rate_hz":
+            animation_rate_hz = _parameter_animation_rate(raw_value)
+        elif field == "animation_speed":
+            animation_speed = _parameter_animation_speed(raw_value)
+        else:
+            raise AttributeError(field)
+
+        if minimum > maximum:
+            raise PlotSpecError("Parameter slider minimum must not exceed maximum.")
+        if value < minimum or value > maximum:
+            raise PlotSpecError("Parameter value must lie within its slider range.")
+
+        self._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=symbol,
+                value=value,
+                metadata=ParameterMetadata(
+                    minimum=minimum,
+                    maximum=maximum,
+                    step=step,
+                    label=label,
+                    animated=animated,
+                    animation_mode=animation_mode,
+                    animation_rate_hz=animation_rate_hz,
+                    animation_speed=animation_speed,
+                ),
+            )
+        )
+
+    def _set_parameter_range(self, symbol: sympy.Basic, raw_range: object) -> None:
+        """Apply a simultaneous direct slider range update."""
+
+        state = self._ensure_parameter_state(symbol)
+        self._explicit_parameter_definitions.add(symbol)
+        minimum, maximum, step = self._parameter_range_parts(
+            raw_range,
+            default_step=state.metadata.step,
+        )
+        if minimum > maximum:
+            raise PlotSpecError("Parameter slider minimum must not exceed maximum.")
+
+        value = state.value
+        if value < minimum:
+            value = minimum
+        if value > maximum:
+            value = maximum
+
+        self._parameter_state_for_spec(
+            ParameterSpec(
+                symbol=symbol,
+                value=value,
+                metadata=ParameterMetadata(
+                    minimum=minimum,
+                    maximum=maximum,
+                    step=step,
+                    label=state.metadata.label,
+                    animated=state.metadata.animated,
+                    animation_mode=state.metadata.animation_mode,
+                    animation_rate_hz=state.metadata.animation_rate_hz,
+                    animation_speed=state.metadata.animation_speed,
+                ),
+            )
+        )
+
+    @classmethod
+    def _parameter_range_parts(
+        cls,
+        raw_range: object,
+        *,
+        default_step: float,
+    ) -> tuple[float, float, float]:
+        """Return validated range parts from a public range assignment."""
+
+        if (
+            isinstance(raw_range, str | bytes | sympy.Basic)
+            or not isinstance(raw_range, Sequence)
+        ):
+            raise PlotSpecError("Parameter range must be a tuple (min, max) or (min, max, step).")
+        if len(raw_range) not in {2, 3}:
+            raise PlotSpecError("Parameter range must be a tuple (min, max) or (min, max, step).")
+
+        minimum = cls._finite_parameter_float(raw_range[0], "minimum")
+        maximum = cls._finite_parameter_float(raw_range[1], "maximum")
+        step = (
+            cls._positive_parameter_float(raw_range[2], "step")
+            if len(raw_range) == 3
+            else default_step
+        )
+        return minimum, maximum, step
+
+    @staticmethod
+    def _finite_parameter_float(value: object, label: str) -> float:
+        """Return a finite float for direct parameter attribute updates."""
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PlotSpecError(f"Parameter {label} must be a finite number.") from exc
+        if not math.isfinite(number):
+            raise PlotSpecError(f"Parameter {label} must be a finite number.")
+        return number
+
+    @staticmethod
+    def _positive_parameter_float(value: object, label: str) -> float:
+        """Return a positive float for direct parameter attribute updates."""
+
+        number = FigureHandle._finite_parameter_float(value, label)
+        if number <= 0:
+            raise PlotSpecError(f"Parameter {label} must be positive.")
+        return number
 
     def _parameter_specs(self) -> dict[sympy.Basic, ParameterSpec]:
         """Return figure-level parameter spec snapshots."""
 
         return {
-            symbol: state.to_spec()
+            symbol: self._defaulted_parameter_spec(symbol, state)
             for symbol, state in self._parameters.items()
         }
 
@@ -3313,6 +4376,9 @@ class FigureHandle:
         for symbol in tuple(self._parameters):
             if symbol not in active_symbols:
                 del self._parameters[symbol]
+        for symbol in tuple(self._parameter_definitions):
+            if symbol not in active_symbols and symbol not in self._explicit_parameter_definitions:
+                del self._parameter_definitions[symbol]
 
     def _create_view(
         self,
@@ -3888,6 +4954,30 @@ def _axis_range(view: AxisView) -> tuple[float, float]:
     return view.minimum, view.maximum
 
 
+def _animation_speed_snapshot(metadata: ParameterMetadata) -> str | float:
+    """Return the public stored animation speed spelling."""
+
+    if metadata.animation_speed is DEFAULT_ANIMATION_SPEED:
+        return DEFAULT_ANIMATION_SPEED.value
+    return float(metadata.animation_speed)
+
+
+def _parameter_metadata_change_stops_animation(
+    previous: ParameterMetadata,
+    current: ParameterMetadata,
+) -> bool:
+    """Return whether a metadata change invalidates running animation state."""
+
+    return (
+        previous.step != current.step
+        or previous.label != current.label
+        or previous.animated != current.animated
+        or previous.animation_mode != current.animation_mode
+        or previous.animation_rate_hz != current.animation_rate_hz
+        or previous.animation_speed != current.animation_speed
+    )
+
+
 def _view_range_snapshot(
     x_range: tuple[float, float],
     y_range: tuple[float, float],
@@ -4012,6 +5102,20 @@ def _plot_view_with_figure_axes(
     if isinstance(view, ListView) and view.inferred:
         return replace(view, x_view=state.x_view)
     return view
+
+
+def _quiet_signal(value: object, *, equal: Callable[[object, object], bool]) -> Signal:
+    """Return a signal initialized without formatting a potentially huge value."""
+
+    signal = Signal(None, equal=equal)
+    _quiet_signal_set(signal, value)
+    return signal
+
+
+def _quiet_signal_set(signal: Signal, value: object) -> None:
+    """Set a signal value without triggering eager debug string formatting."""
+
+    signal._set_internal(value)
 
 
 def _semantic_equal(old: object, new: object) -> bool:

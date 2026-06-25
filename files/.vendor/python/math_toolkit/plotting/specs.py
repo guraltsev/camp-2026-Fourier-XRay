@@ -7,6 +7,7 @@ class PlotSpecError(Exception):
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 import math
 import re
 from typing import Any
@@ -39,6 +40,27 @@ DEFAULT_VIEW_Y_HALF_WIDTH = 1.7
 DEFAULT_LAYOUT_WIDTH = 700.0
 DEFAULT_LAYOUT_HEIGHT = 450.0
 _DIGIT_RUN = re.compile(r"\d+")
+
+# Animation cadence is intentionally discrete so the Python coordinator can
+# bound recomputation work while still offering common notebook-friendly rates.
+ALLOWED_PARAMETER_ANIMATION_RATES = frozenset({60.0, 30.0, 20.0, 10.0, 5.0, 2.0, 1.0})
+
+
+class ParameterAnimationMode(str, Enum):
+    """Describe how a parameter moves when animation reaches a range boundary."""
+
+    FORWARD = "forward"
+    BOUNCE = "bounce"
+    WRAP = "wrap"
+
+
+class ParameterAnimationSpeedDefault(Enum):
+    """Represent the step-derived default parameter animation speed."""
+
+    DEFAULT = "default"
+
+
+DEFAULT_ANIMATION_SPEED = ParameterAnimationSpeedDefault.DEFAULT
 
 
 @dataclass(frozen=True)
@@ -156,6 +178,18 @@ class ParameterMetadata:
     maximum: float
     step: float
     label: str | None = None
+    animated: bool = True
+    animation_mode: ParameterAnimationMode = ParameterAnimationMode.BOUNCE
+    animation_rate_hz: float = 20.0
+    animation_speed: float | ParameterAnimationSpeedDefault = DEFAULT_ANIMATION_SPEED
+
+    @property
+    def animation_speed_effective(self) -> float:
+        """Return the concrete value-units-per-second animation speed."""
+
+        if self.animation_speed is DEFAULT_ANIMATION_SPEED:
+            return 2.0 * self.step
+        return float(self.animation_speed)
 
 
 @dataclass(frozen=True)
@@ -1117,7 +1151,24 @@ def _apply_parameter_update(
     """Apply one public parameter value or metadata dictionary."""
 
     if isinstance(raw_spec, Mapping):
-        unknown = set(raw_spec) - {"value", "min", "max", "step", "label"}
+        if "current_value" in raw_spec:
+            raise PlotSpecError(
+                "Parameter specs cannot use 'current_value'; use 'value' to set "
+                "both the current and default value."
+            )
+
+        unknown = set(raw_spec) - {
+            "value",
+            "default_value",
+            "min",
+            "max",
+            "step",
+            "label",
+            "animated",
+            "animation_mode",
+            "animation_rate_hz",
+            "animation_speed",
+        }
         if unknown:
             raise PlotSpecError(
                 "Parameter specs must be supplied through fig.parameters({symbol: value}) "
@@ -1128,8 +1179,14 @@ def _apply_parameter_update(
         metadata = base.metadata
         provided = set(raw_spec)
 
+        if "value" in raw_spec and "default_value" in raw_spec:
+            raise PlotSpecError(
+                "Parameter specs must use 'value' or split value fields, not both."
+            )
         if "value" in raw_spec:
             value = _finite_float(raw_spec["value"], "parameter value")
+        if "default_value" in raw_spec:
+            value = _finite_float(raw_spec["default_value"], "parameter default value")
         if "min" in raw_spec:
             metadata = replace(
                 metadata,
@@ -1148,6 +1205,26 @@ def _apply_parameter_update(
         if "label" in raw_spec:
             label = raw_spec["label"]
             metadata = replace(metadata, label=None if label is None else str(label))
+        if "animated" in raw_spec:
+            animated = raw_spec["animated"]
+            if not isinstance(animated, bool):
+                raise PlotSpecError("Parameter animated must be True or False.")
+            metadata = replace(metadata, animated=animated)
+        if "animation_mode" in raw_spec:
+            metadata = replace(
+                metadata,
+                animation_mode=_parameter_animation_mode(raw_spec["animation_mode"]),
+            )
+        if "animation_rate_hz" in raw_spec:
+            metadata = replace(
+                metadata,
+                animation_rate_hz=_parameter_animation_rate(raw_spec["animation_rate_hz"]),
+            )
+        if "animation_speed" in raw_spec:
+            metadata = replace(
+                metadata,
+                animation_speed=_parameter_animation_speed(raw_spec["animation_speed"]),
+            )
         return _validated_parameter_spec(base.symbol, value, metadata, provided)
 
     value = _finite_float(raw_spec, "parameter value")
@@ -1173,8 +1250,8 @@ def _validated_parameter_spec(
     if "max" not in explicitly_provided and value > maximum:
         maximum = value
 
-    if minimum >= maximum:
-        raise PlotSpecError("Parameter slider minimum must be less than maximum.")
+    if minimum > maximum:
+        raise PlotSpecError("Parameter slider minimum must not exceed maximum.")
     if value < minimum or value > maximum:
         raise PlotSpecError("Parameter value must lie within its slider range.")
 
@@ -1186,8 +1263,51 @@ def _validated_parameter_spec(
             maximum=maximum,
             step=metadata.step,
             label=metadata.label,
+            animated=metadata.animated,
+            animation_mode=metadata.animation_mode,
+            animation_rate_hz=metadata.animation_rate_hz,
+            animation_speed=metadata.animation_speed,
         ),
     )
+
+
+def _parameter_animation_mode(value: object) -> ParameterAnimationMode:
+    """Return a validated parameter animation mode."""
+
+    try:
+        return ParameterAnimationMode(value)
+    except ValueError as exc:
+        raise PlotSpecError(
+            "Parameter animation_mode must be 'forward', 'bounce', or 'wrap'."
+        ) from exc
+
+
+def _parameter_animation_rate(value: object) -> float:
+    """Return a supported parameter animation recomputation rate."""
+
+    if isinstance(value, bool):
+        raise PlotSpecError(
+            "Parameter animation_rate_hz must be one of 60, 30, 20, 10, 5, 2, or 1."
+        )
+    rate = _finite_float(value, "parameter animation_rate_hz")
+    if rate not in ALLOWED_PARAMETER_ANIMATION_RATES:
+        raise PlotSpecError(
+            "Parameter animation_rate_hz must be one of 60, 30, 20, 10, 5, 2, or 1."
+        )
+    return rate
+
+
+def _parameter_animation_speed(
+    value: object,
+) -> float | ParameterAnimationSpeedDefault:
+    """Return a validated stored parameter animation speed."""
+
+    if value == DEFAULT_ANIMATION_SPEED.value:
+        return DEFAULT_ANIMATION_SPEED
+    if value is None or isinstance(value, bool):
+        raise PlotSpecError("Parameter animation_speed must be positive or 'default'.")
+    speed = _positive_float(value, "parameter animation_speed")
+    return speed
 
 
 def _is_coefficient_like(

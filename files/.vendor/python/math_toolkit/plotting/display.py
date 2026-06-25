@@ -13,7 +13,14 @@ from . import renderer as renderer_module
 from .renderer import PlotlyRenderer
 
 if TYPE_CHECKING:
-    from .model import FigureHandle, InfoCardSnapshot, LegendItem, PlotNode, SliderValueItem
+    from .model import (
+        FigureHandle,
+        InfoCardSnapshot,
+        LegendItem,
+        ParameterAnimationStateItem,
+        PlotNode,
+        SliderValueItem,
+    )
 
 
 class WidgetLayoutShell:
@@ -493,6 +500,7 @@ class FigureDisplayGeneration:
         self.figure.reconcile_legend()
         self.figure.reconcile_controls()
         self.figure.sync_controls(self.figure.slider_value_snapshot())
+        self.figure.sync_animation_state(self.figure.animation_state_snapshot())
         if self.frontend is not None:
             self.frontend.set_info(self.figure.info_snapshot())
         else:
@@ -554,6 +562,17 @@ class FigureDisplayGeneration:
         else:
             sync_parameter_controls(self, values)
 
+    def sync_animation_state(
+        self,
+        values: tuple[ParameterAnimationStateItem, ...],
+    ) -> None:
+        """Mirror animation play state into this generation's controls."""
+
+        if self.state != "active":
+            return
+        if self.frontend is not None:
+            self.frontend.sync_animation_state(values)
+
     def defer_info_updates(self) -> object:
         """Return a context manager that postpones expensive info rendering."""
 
@@ -607,6 +626,7 @@ class FigureDisplayGeneration:
 
         if self.state != "active":
             return
+        self.figure._animation_coordinator.stop_all()
         self.state = "disconnected"
         self._dispose_effects()
         self._dispose_control_observers()

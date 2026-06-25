@@ -14,6 +14,7 @@ from ..specs import (
     CurveView,
     PLOT_KIND_CURVE,
     PLOT_KIND_PARAMETRIC,
+    ParameterMetadata,
     ParametricView,
 )
 
@@ -79,6 +80,9 @@ class AnywidgetModalController:
             return
         state = self.generation.figure.parameters[symbol]
         metadata = state.metadata
+        default_value = self.generation.figure._default_parameter_value(symbol)
+        if default_value is None:
+            default_value = state.value
         self.kind = "parameter"
         self.target = {"node_id": int(node_id), "symbol": str(symbol)}
         self.fields = {
@@ -87,29 +91,35 @@ class AnywidgetModalController:
                 "Label",
                 "text",
                 metadata.label or "",
-                group="Identity",
+                group="Parameter",
             ),
-            "value": ModalField("value", "Value", "float", state.value, group="Range"),
+            "default_value": ModalField(
+                "default_value",
+                "Default value",
+                "float",
+                default_value,
+                group="Parameter",
+            ),
             "minimum": ModalField(
                 "minimum",
                 "Minimum",
                 "float",
                 metadata.minimum,
-                group="Range",
+                group="Parameter",
             ),
             "maximum": ModalField(
                 "maximum",
                 "Maximum",
                 "float",
                 metadata.maximum,
-                group="Range",
+                group="Parameter",
             ),
             "step": ModalField(
                 "step",
                 "Step",
                 "positive_float",
                 metadata.step,
-                group="Range",
+                group="Parameter",
             ),
         }
         self._publish("Parameter Settings")
@@ -131,18 +141,18 @@ class AnywidgetModalController:
                 "Name",
                 "readonly",
                 "" if node.name is None else node.name,
-                group="Identity",
+                group="Plot",
             ),
-            "label": ModalField("label", "Label", "text", node.label, group="Identity"),
+            "label": ModalField("label", "Label", "text", node.label, group="Plot"),
             "visible": ModalField(
                 "visible",
                 "Visible",
                 "checkbox",
                 node.legend_item_snapshot().visible,
-                group="Identity",
+                group="Plot",
             ),
         }
-        sample_fields = _sample_fields_for_view(node.view)
+        sample_fields = _sample_fields_for_view(node.view, group="Plot")
         fields.update(sample_fields)
         if node.kind in {PLOT_KIND_CURVE, PLOT_KIND_PARAMETRIC}:
             color = style.get("color", "#1f77b4")
@@ -154,7 +164,7 @@ class AnywidgetModalController:
                         "color",
                         color,
                         _color_option_payload(color),
-                        group="Line",
+                        group="Plot",
                         meta={"picker": _picker_hex_color(color) or "#1f77b4"},
                     ),
                     "width": ModalField(
@@ -162,14 +172,14 @@ class AnywidgetModalController:
                         "Width",
                         "line_width",
                         style.get("width", 2.0),
-                        group="Line",
+                        group="Plot",
                     ),
                     "opacity": ModalField(
                         "opacity",
                         "Opacity",
                         "opacity",
                         style.get("opacity", 1.0),
-                        group="Line",
+                        group="Plot",
                     ),
                     "dash": ModalField(
                         "dash",
@@ -177,11 +187,18 @@ class AnywidgetModalController:
                         "dash",
                         style.get("dash", "solid"),
                         _dash_option_payload(),
-                        group="Line",
+                        group="Plot",
                     ),
                 }
             )
         if node.kind == PLOT_KIND_CURVE:
+            fields["sound_enabled"] = ModalField(
+                "sound_enabled",
+                "Enabled",
+                "checkbox",
+                self.generation.figure._handle_for_node(node).sound.enabled,
+                group="Sound",
+            )
             fields["normalization"] = ModalField(
                 "normalization",
                 "Normalization",
@@ -289,11 +306,11 @@ class AnywidgetModalController:
         if self.kind == "parameter" and not errors:
             minimum = float(self.fields["minimum"].value)
             maximum = float(self.fields["maximum"].value)
-            value = float(self.fields["value"].value)
-            if minimum >= maximum:
-                errors.append("Parameter minimum must be less than maximum.")
-            if value < minimum or value > maximum:
-                errors.append("Parameter value must lie within the slider range.")
+            default_value = float(self.fields["default_value"].value)
+            if minimum > maximum:
+                errors.append("Parameter minimum must not exceed maximum.")
+            if default_value < minimum or default_value > maximum:
+                errors.append("Parameter default value must lie within the slider range.")
         return tuple(errors)
 
     def _apply_parameter(self) -> None:
@@ -305,15 +322,16 @@ class AnywidgetModalController:
         if self._plot_node_for_parameter(int(self.target.get("node_id", 0)), symbol) is None:
             raise PlotSpecError("This parameter is no longer present in the active figure.")
         label = str(self.fields["label"].value)
-        self.generation.figure.params = {
-            symbol: {
-                "label": label if label != "" else None,
-                "value": float(self.fields["value"].value),
-                "min": float(self.fields["minimum"].value),
-                "max": float(self.fields["maximum"].value),
-                "step": float(self.fields["step"].value),
-            }
-        }
+        self.generation.figure._set_parameter_default_spec(
+            symbol,
+            float(self.fields["default_value"].value),
+            ParameterMetadata(
+                minimum=float(self.fields["minimum"].value),
+                maximum=float(self.fields["maximum"].value),
+                step=float(self.fields["step"].value),
+                label=label if label != "" else None,
+            ),
+        )
 
     def _apply_plot(self) -> None:
         """Commit a validated plot draft to model state."""
@@ -335,6 +353,7 @@ class AnywidgetModalController:
                 dash=str(self.fields["dash"].value),
             )
         if "normalization" in self.fields:
+            handle.sound.enabled = bool(self.fields["sound_enabled"].value)
             handle.sound.normalization = bool(self.fields["normalization"].value)
 
     def _sample_update(self) -> object | None:
@@ -381,7 +400,11 @@ class AnywidgetModalController:
         return None
 
 
-def _sample_fields_for_view(view: object) -> dict[str, ModalField]:
+def _sample_fields_for_view(
+    view: object,
+    *,
+    group: str = "Sampling",
+) -> dict[str, ModalField]:
     """Return sample-count modal fields for a plot view."""
 
     if isinstance(view, CurveView | ParametricView):
@@ -391,7 +414,7 @@ def _sample_fields_for_view(view: object) -> dict[str, ModalField]:
                 "Samples",
                 "sample_count",
                 view.samples,
-                group="Sampling",
+                group=group,
             )
         }
     if isinstance(view, CartesianView2D):
@@ -401,14 +424,14 @@ def _sample_fields_for_view(view: object) -> dict[str, ModalField]:
                 "X samples",
                 "sample_count",
                 view.x_samples,
-                group="Sampling",
+                group=group,
             ),
             "y_samples": ModalField(
                 "y_samples",
                 "Y samples",
                 "sample_count",
                 view.y_samples,
-                group="Sampling",
+                group=group,
             ),
         }
     return {}

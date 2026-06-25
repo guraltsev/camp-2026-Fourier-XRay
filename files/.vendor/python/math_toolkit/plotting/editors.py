@@ -24,6 +24,7 @@ from .specs import (
     CurveView,
     PLOT_KIND_CURVE,
     PLOT_KIND_PARAMETRIC,
+    ParameterMetadata,
     ParametricView,
 )
 
@@ -70,8 +71,15 @@ class PlotStylePanel:
             if self.sound_fields_enabled
             else False,
         )
+        self.sound_enabled = BoolField(
+            "Enabled",
+            figure._handle_for_node(node).sound.enabled
+            if self.sound_fields_enabled
+            else False,
+        )
 
-        children = [self.name.widget, self.label.widget, self.visible.widget]
+        identity_children = [self.name.widget, self.label.widget, self.visible.widget]
+        sampling_children: list[object] = []
         if self.sample_fields:
             self.sampling_row = ipywidgets.HBox(
                 [field.widget for field in self.sample_fields],
@@ -90,7 +98,9 @@ class PlotStylePanel:
             if add_class is not None:
                 add_class("mt-plot-sampling-row")
             no_scroll(self.sampling_row)
-            children.append(self.sampling_row)
+            sampling_children.append(self.sampling_row)
+        style_children: list[object] = []
+        sound_children: list[object] = []
         if self.line_fields_enabled:
             self.style_row = ipywidgets.HBox(
                 [self.color.widget, self.width.widget],
@@ -126,31 +136,32 @@ class PlotStylePanel:
             if add_class is not None:
                 add_class("mt-plot-line-style-row")
             no_scroll(self.line_style_row)
-            children.extend(
+            style_children.extend(
                 [
                     self.style_row,
                     self.line_style_row,
                 ]
             )
             if self.sound_fields_enabled:
-                children.append(self.normalization.widget)
+                sound_children.append(self.sound_enabled.widget)
+                sound_children.append(self.normalization.widget)
         else:
-            children.append(
+            style_children.append(
                 ipywidgets.HTML(
                     value=(
                         "<p>Style editing for this plot type is not implemented yet.</p>"
                     )
                 )
             )
-        self.widget = ipywidgets.VBox(
-            children,
-            layout=ipywidgets.Layout(
-                grid_gap="0.5rem",
-                overflow="hidden",
-                width="100%",
-            ),
+        plot_children = identity_children + sampling_children + style_children
+        tabs: list[tuple[str, list[object]]] = [
+            ("Plot", plot_children),
+            ("Sound", sound_children),
+        ]
+        self.widget = _tabbed_widget(
+            [(title, children) for title, children in tabs if children],
+            ipywidgets=ipywidgets,
         )
-        no_scroll(self.widget)
 
     def _ipython_display_(self) -> None:
         """Display the underlying ipywidgets form."""
@@ -196,6 +207,7 @@ class PlotStylePanel:
                 dash=self.dash.value,
             )
         if self.sound_fields_enabled:
+            handle.sound.enabled = self.sound_enabled.value
             handle.sound.normalization = self.normalization.value
 
     def cancel(self) -> None:
@@ -227,25 +239,43 @@ class ParameterConfigPanel:
         self.symbol = symbol
         self._original_label = metadata.label
         self.label = TextField("Label", "" if metadata.label is None else metadata.label)
-        self.value = FloatField("Value", state.value)
+        default_value = figure._default_parameter_value(symbol)
+        if default_value is None:
+            default_value = state.value
+        self.default_value = FloatField("Default value", default_value)
         self.minimum = FloatField("Minimum", metadata.minimum)
         self.maximum = FloatField("Maximum", metadata.maximum)
         self.step = PositiveFloatField("Step", metadata.step)
-        self.widget = ipywidgets.VBox(
-            [
-                self.label.widget,
-                self.value.widget,
-                self.minimum.widget,
-                self.maximum.widget,
-                self.step.widget,
-            ],
+        self.range_row = ipywidgets.HBox(
+            [self.minimum.widget, self.maximum.widget, self.step.widget],
             layout=ipywidgets.Layout(
-                grid_gap="0.5rem",
+                align_items="center",
+                flex_flow="row wrap",
+                grid_gap="0.35rem 1.35rem",
                 overflow="hidden",
                 width="100%",
             ),
         )
-        no_scroll(self.widget)
+        for field in (self.minimum, self.maximum, self.step):
+            field.widget.layout.flex = "0 1 auto"
+            field.widget.layout.width = "auto"
+        add_class = getattr(self.range_row, "add_class", None)
+        if add_class is not None:
+            add_class("mt-parameter-range-row")
+        no_scroll(self.range_row)
+        self.widget = _tabbed_widget(
+            [
+                (
+                    "Parameter",
+                    [
+                        self.label.widget,
+                        self.default_value.widget,
+                        self.range_row,
+                    ],
+                ),
+            ],
+            ipywidgets=ipywidgets,
+        )
 
     def _ipython_display_(self) -> None:
         """Display the underlying ipywidgets form."""
@@ -264,18 +294,18 @@ class ParameterConfigPanel:
         """Return parameter validation errors without mutating model state."""
 
         errors: list[str] = []
-        for field in (self.value, self.minimum, self.maximum, self.step):
+        for field in (self.default_value, self.minimum, self.maximum, self.step):
             errors.extend(field.errors())
         if errors:
             return tuple(errors)
 
         minimum = self.minimum.value
         maximum = self.maximum.value
-        value = self.value.value
-        if minimum >= maximum:
-            errors.append("Parameter minimum must be less than maximum.")
-        if value < minimum or value > maximum:
-            errors.append("Parameter value must lie within the slider range.")
+        default_value = self.default_value.value
+        if minimum > maximum:
+            errors.append("Parameter minimum must not exceed maximum.")
+        if default_value < minimum or default_value > maximum:
+            errors.append("Parameter default value must lie within the slider range.")
         if not math.isfinite(self.step.value) or self.step.value <= 0:
             errors.append("Parameter step must be a finite positive value.")
         return tuple(errors)
@@ -292,15 +322,16 @@ class ParameterConfigPanel:
         label = self.label.value
         if label == "" and self._original_label is None:
             label = None
-        self.figure.params = {
-            self.symbol: {
-                "label": label,
-                "value": self.value.value,
-                "min": self.minimum.value,
-                "max": self.maximum.value,
-                "step": self.step.value,
-            }
-        }
+        self.figure._set_parameter_default_spec(
+            self.symbol,
+            self.default_value.value,
+            ParameterMetadata(
+                minimum=self.minimum.value,
+                maximum=self.maximum.value,
+                step=self.step.value,
+                label=label,
+            ),
+        )
 
     def cancel(self) -> None:
         """Close the panel without writing draft state."""
@@ -353,3 +384,42 @@ def _sample_update_from_fields(fields: tuple[SampleCountField, ...]) -> object |
     if len(fields) == 1:
         return fields[0].value
     return fields[0].value, fields[1].value
+
+
+def _tabbed_widget(
+    tabs: list[tuple[str, list[object]]],
+    *,
+    ipywidgets: object,
+) -> object:
+    """Return an ipywidgets tab panel for grouped settings fields."""
+
+    panels = []
+    for _title, children in tabs:
+        panel = ipywidgets.VBox(
+            children,
+            layout=ipywidgets.Layout(
+                grid_gap="0.5rem",
+                overflow="hidden",
+                width="100%",
+            ),
+        )
+        add_class = getattr(panel, "add_class", None)
+        if add_class is not None:
+            add_class("mt-config-tab-panel")
+        no_scroll(panel)
+        panels.append(panel)
+
+    widget = ipywidgets.Tab(
+        panels,
+        layout=ipywidgets.Layout(
+            overflow="visible",
+            width="100%",
+        ),
+    )
+    for index, (title, _children) in enumerate(tabs):
+        widget.set_title(index, title)
+    add_class = getattr(widget, "add_class", None)
+    if add_class is not None:
+        add_class("mt-config-tabs")
+    no_scroll(widget)
+    return widget

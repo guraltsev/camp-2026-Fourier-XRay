@@ -6,6 +6,7 @@ from dataclasses import replace
 import math
 from typing import TYPE_CHECKING, Callable
 
+from . import messages
 from .markdown import render_markdown_payload
 
 from .widgets import (
@@ -20,7 +21,11 @@ if TYPE_CHECKING:
     import sympy
 
     from ..display import FigureDisplayGeneration
-    from ..model import ControlLayoutItem, SliderValueItem
+    from ..model import (
+        ControlLayoutItem,
+        ParameterAnimationStateItem,
+        SliderValueItem,
+    )
 
 __all__ = ["AnywidgetParameterControls", "ParameterControlWidget"]
 
@@ -36,12 +41,14 @@ class ParameterControlWidget(HBoxWidget):
         minimum: float,
         maximum: float,
         step: float,
+        animated: bool = True,
         markdown_payload: Callable[[str], dict[str, str]] | None = None,
         native_markdown_label: bool = False,
     ) -> None:
         """Create a parameter control from small traitlet-backed widgets."""
 
         self.native_markdown_label = bool(native_markdown_label)
+        self._animation_enabled = bool(animated)
         if self.native_markdown_label:
             import ipywidgets as ipywidgets
 
@@ -58,11 +65,13 @@ class ParameterControlWidget(HBoxWidget):
             )
         self.value_entry = TextEntryWidget(
             _format_number(value),
+            commit_message_type=messages.COMMIT_PARAMETER_VALUE,
             class_name="mt-text-entry--value",
         )
         self.reset_button = ButtonWidget(
             "refresh",
             title="Reset parameter to default",
+            click_message_type=messages.RESET_PARAMETER,
             class_name="mt-param-row__reset",
         )
         self.label_value = HBoxWidget(
@@ -78,8 +87,16 @@ class ParameterControlWidget(HBoxWidget):
             step=step,
             class_name="mt-param-row__slider",
         )
+        self.animation_button = ButtonWidget(
+            "play",
+            title="Animate parameter",
+            disabled=not bool(animated),
+            click_message_type=messages.PARAMETER_ANIMATION_BUTTON,
+            class_name="mt-param-row__animate",
+        )
         self.minimum_entry = TextEntryWidget(
             _format_limit_number(minimum),
+            commit_message_type=messages.COMMIT_PARAMETER_MINIMUM,
             class_name="mt-text-entry--limit mt-text-entry--minimum",
             style={
                 "background": "transparent",
@@ -92,6 +109,7 @@ class ParameterControlWidget(HBoxWidget):
         )
         self.maximum_entry = TextEntryWidget(
             _format_limit_number(maximum),
+            commit_message_type=messages.COMMIT_PARAMETER_MAXIMUM,
             class_name="mt-text-entry--limit mt-text-entry--maximum",
             style={
                 "background": "transparent",
@@ -103,7 +121,7 @@ class ParameterControlWidget(HBoxWidget):
             },
         )
         self.slider_stack = HBoxWidget(
-            (self.minimum_entry, self.slider, self.maximum_entry),
+            (self.minimum_entry, self.slider, self.animation_button, self.maximum_entry),
             gap="0.18rem",
             align_items="center",
             class_name="mt-param-row__slider-stack",
@@ -117,6 +135,7 @@ class ParameterControlWidget(HBoxWidget):
         self.edit_button = ButtonWidget(
             "gear",
             title="Edit parameter settings",
+            click_message_type=messages.OPEN_PARAMETER_SETTINGS,
             class_name="mt-param-row__edit",
         )
         super().__init__(
@@ -200,6 +219,7 @@ class ParameterControlWidget(HBoxWidget):
         self.reset_button.disabled = disabled
         self.minimum_entry.disabled = disabled
         self.maximum_entry.disabled = disabled
+        self.animation_button.disabled = disabled or not self._animation_enabled
         self.edit_button.disabled = disabled
 
     @property
@@ -219,6 +239,7 @@ class ParameterControlWidget(HBoxWidget):
         minimum: float,
         maximum: float,
         step: float,
+        animated: bool = True,
     ) -> None:
         """Synchronize layout metadata without changing the slider value."""
 
@@ -226,6 +247,22 @@ class ParameterControlWidget(HBoxWidget):
         self.minimum = minimum
         self.maximum = maximum
         self.step = step
+        self._animation_enabled = bool(animated)
+        self.animation_button.disabled = self.disabled or not self._animation_enabled
+
+    @property
+    def animation_running(self) -> bool:
+        """Return whether the animation button is showing a pause action."""
+
+        return self.animation_button.label == "pause"
+
+    @animation_running.setter
+    def animation_running(self, value: bool) -> None:
+        running = bool(value)
+        self.animation_button.label = "pause" if running else "play"
+        self.animation_button.title = (
+            "Pause parameter animation" if running else "Animate parameter"
+        )
 
     def _set_native_label_markdown(self, value: str) -> None:
         """Update a native Jupyter Markdown output label."""
@@ -259,6 +296,8 @@ class AnywidgetParameterControls:
         self.widgets: dict[tuple[int, str], ParameterControlWidget] = {}
         self._observers: dict[tuple[int, str], tuple[tuple[object, str, object], ...]]
         self._observers = {}
+        self._message_observers: dict[tuple[int, str], tuple[tuple[object, object], ...]]
+        self._message_observers = {}
         self._syncing_widget_values = False
         self._browser_value_event_depth = 0
 
@@ -295,6 +334,21 @@ class AnywidgetParameterControls:
             if widget is not None:
                 self._sync_widget_value(widget, float(item.value))
 
+    def sync_animation_state(
+        self,
+        values: tuple[ParameterAnimationStateItem, ...],
+    ) -> None:
+        """Mirror Python-owned animation play state into child buttons."""
+
+        running_by_symbol = {str(item.symbol): bool(item.running) for item in values}
+        for key, widget in self.widgets.items():
+            running = running_by_symbol.get(key[1], False)
+            self._run_widget_sync(lambda widget=widget, running=running: setattr(
+                widget,
+                "animation_running",
+                running,
+            ))
+
     def disable(self) -> None:
         """Disable all child widgets without removing their visible views."""
 
@@ -309,6 +363,7 @@ class AnywidgetParameterControls:
         self.shell.set_controls(())
         self.layout_items.clear()
         self.value_items.clear()
+        self._message_observers.clear()
         self._syncing_widget_values = False
         self._browser_value_event_depth = 0
 
@@ -326,6 +381,7 @@ class AnywidgetParameterControls:
             minimum=float(item.minimum),
             maximum=float(item.maximum),
             step=float(item.step),
+            animated=bool(item.animated),
             markdown_payload=self.markdown_payload,
             native_markdown_label=self.native_markdown_labels,
         )
@@ -383,6 +439,96 @@ class AnywidgetParameterControls:
             if state is not None:
                 state.set_value(default_value)
 
+        def _on_animation(_change: dict[str, object], *, control_key=key) -> None:
+            if not self.generation.accepts_frontend_events():
+                return
+            symbol = self._symbol_for_text(control_key[1])
+            if symbol is not None:
+                state = self.generation.figure.parameters.get(symbol)
+                if state is not None:
+                    state.animate.toggle()
+
+        def _on_value_commit_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") == messages.COMMIT_PARAMETER_VALUE:
+                if not self.generation.accepts_frontend_events():
+                    return
+                self._commit_value_text(control_key, content.get("value"))
+
+        def _on_minimum_commit_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") == messages.COMMIT_PARAMETER_MINIMUM:
+                if not self.generation.accepts_frontend_events():
+                    return
+                self._commit_limit_text(control_key, "minimum", content.get("value"))
+
+        def _on_maximum_commit_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") == messages.COMMIT_PARAMETER_MAXIMUM:
+                if not self.generation.accepts_frontend_events():
+                    return
+                self._commit_limit_text(control_key, "maximum", content.get("value"))
+
+        def _on_reset_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") == messages.RESET_PARAMETER:
+                _on_reset({}, control_key=control_key)
+
+        def _on_edit_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") == messages.OPEN_PARAMETER_SETTINGS:
+                _on_edit({}, control_key=control_key)
+
+        def _on_animation_message(
+            _widget: object,
+            content: dict[str, object],
+            _buffers: object,
+            *,
+            control_key=key,
+        ) -> None:
+            if content.get("type") != messages.PARAMETER_ANIMATION_BUTTON:
+                return
+            if not self.generation.accepts_frontend_events():
+                return
+            symbol = self._symbol_for_text(control_key[1])
+            if symbol is None:
+                return
+            state = self.generation.figure.parameters.get(symbol)
+            if state is None:
+                return
+            action = content.get("action")
+            if action == "pause":
+                state.animate.stop()
+            elif action == "play":
+                state.animate.start()
+            else:
+                state.animate.toggle()
+
         observers = (
             (widget.slider, "browser_value", _on_value),
             (widget.slider, "release_count", _on_release),
@@ -390,12 +536,24 @@ class AnywidgetParameterControls:
             (widget.minimum_entry, "commit_count", _on_minimum_commit),
             (widget.maximum_entry, "commit_count", _on_maximum_commit),
             (widget.reset_button, "click_count", _on_reset),
+            (widget.animation_button, "click_count", _on_animation),
             (widget.edit_button, "click_count", _on_edit),
         )
         for observed_widget, name, callback in observers:
             observed_widget.observe(callback, names=name)
+        message_observers = (
+            (widget.value_entry, _on_value_commit_message),
+            (widget.minimum_entry, _on_minimum_commit_message),
+            (widget.maximum_entry, _on_maximum_commit_message),
+            (widget.reset_button, _on_reset_message),
+            (widget.animation_button, _on_animation_message),
+            (widget.edit_button, _on_edit_message),
+        )
+        for observed_widget, callback in message_observers:
+            observed_widget.on_msg(callback)
         self.widgets[key] = widget
         self._observers[key] = observers
+        self._message_observers[key] = message_observers
         return widget
 
     def _dispose_widget(self, key: tuple[int, str]) -> None:
@@ -403,9 +561,17 @@ class AnywidgetParameterControls:
 
         widget = self.widgets.pop(key, None)
         observers = self._observers.pop(key, ())
+        message_observers = self._message_observers.pop(key, ())
         for observed_widget, name, callback in observers:
             observed_widget.unobserve(callback, names=name)
+        for observed_widget, callback in message_observers:
+            observed_widget.on_msg(callback, remove=True)
         if widget is not None:
+            symbol = self._symbol_for_text(key[1])
+            if symbol is not None:
+                state = self.generation.figure.parameters.get(symbol)
+                if state is not None:
+                    state.animate.stop()
             close = getattr(widget, "close", None)
             if callable(close):
                 close()
@@ -423,6 +589,7 @@ class AnywidgetParameterControls:
                 minimum=float(item.minimum),
                 maximum=float(item.maximum),
                 step=float(item.step),
+                animated=bool(item.animated),
             )
         )
 
@@ -511,7 +678,7 @@ class AnywidgetParameterControls:
         metadata = state.metadata_signal()
         minimum = number if side == "minimum" else metadata.minimum
         maximum = number if side == "maximum" else metadata.maximum
-        if minimum >= maximum:
+        if minimum > maximum:
             self.generation.figure.reconcile_controls()
             return
 
