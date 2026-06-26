@@ -333,25 +333,47 @@ class AnywidgetFrontendBackend:
             return
         message_type = content.get("type")
         if message_type == messages.OPEN_PARAMETER_SETTINGS:
-            self.modal.open_parameter(
-                node_id=content.get("node_id"),
-                symbol_text=content.get("symbol"),
+            self._queue_interaction(
+                lambda: self.modal.open_parameter(
+                    node_id=content.get("node_id"),
+                    symbol_text=content.get("symbol"),
+                )
             )
         elif message_type == messages.TOGGLE_PLOT_VISIBILITY:
-            self.legend.toggle_visibility(content.get("node_id"))
+            self._queue_interaction(lambda: self.legend.toggle_visibility(content.get("node_id")))
         elif message_type == messages.TOGGLE_PLOT_SOUND:
-            self.legend.toggle_sound(content.get("node_id"))
+            self._queue_interaction(lambda: self.legend.toggle_sound(content.get("node_id")))
         elif message_type == messages.RESET_PLOT_SOUND:
-            self.legend.reset_sound(content.get("node_id"))
+            self._queue_interaction(
+                lambda: self.legend.reset_sound(content.get("node_id")),
+                clear_pending=True,
+            )
         elif message_type == messages.OPEN_PLOT_SETTINGS:
-            self.modal.open_plot(node_id=content.get("node_id"))
+            self._queue_interaction(lambda: self.modal.open_plot(node_id=content.get("node_id")))
         elif message_type == messages.MODAL_FIELD_CHANGED:
-            self.modal.update_field(content.get("field_id"), content.get("value"))
+            self._queue_interaction(
+                lambda: self.modal.update_field(content.get("field_id"), content.get("value"))
+            )
         elif message_type == messages.MODAL_APPLY:
-            self.modal.apply()
+            self._queue_interaction(lambda: self.modal.apply())
         elif message_type in {messages.MODAL_CANCEL, messages.MODAL_CLOSE}:
+            self._queue_interaction(lambda: self.modal.close(), clear_pending=True)
+
+    def _queue_interaction(
+        self,
+        action: object,
+        *,
+        clear_pending: bool = False,
+    ) -> None:
+        """Queue one shell-originated interaction on the owning figure."""
+
+        def guarded_action() -> None:
             if self.generation.accepts_frontend_events():
-                self.modal.close()
+                action()
+
+        figure = self.generation.figure
+        figure.enqueue_interaction(guarded_action, clear_pending=clear_pending)
+        figure.drain_interactions()
 
 
 class MarimoFrontendBackend(AnywidgetFrontendBackend):

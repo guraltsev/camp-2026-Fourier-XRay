@@ -216,6 +216,12 @@ class NumCompiler:
         """Evaluate a generic tree node and return its compilation execution strategy."""
         node = ctx.current_node
 
+        # Treat piecewise expressions as a control-flow boundary. Lambdified
+        # Piecewise expressions eagerly evaluate branch payloads, which defeats
+        # scalar guard conditions such as plotting mode cutoffs.
+        if isinstance(node, sympy.Piecewise):
+            return self._compile_piecewise(ctx, metadata)
+
         # Finite reductions still own a local environment for their bound
         # variables. Their expression and bound children are compiled through
         # the generated path, so nested runtime operators keep seeing those
@@ -838,14 +844,30 @@ class NumCompiler:
             cond_nodes.append(self._compile_node(pair_ctx.with_descend(1), metadata))
 
         def eval_piecewise(env: dict[sympy.Symbol, Any], exec_meta: LastExecutionMetadata) -> Any:
+            array_branches: list[tuple[Any, np.ndarray]] = []
             result = None
-            for expr_node, cond_node in reversed(list(zip(expr_nodes, cond_nodes))):
-                expr_value = expr_node.evaluator(env, exec_meta)
+
+            # Scalar conditions can choose or skip a branch without evaluating
+            # that branch's payload. Array-valued conditions still use NumPy
+            # selection semantics after collecting the branches that matter.
+            for expr_node, cond_node in zip(expr_nodes, cond_nodes):
                 cond_value = cond_node.evaluator(env, exec_meta)
-                if result is None:
-                    result = expr_value
-                else:
-                    result = np.where(cond_value, expr_value, result)
+                cond_array = np.asarray(cond_value, dtype=bool)
+                if cond_array.shape == ():
+                    if bool(cond_array):
+                        result = expr_node.evaluator(env, exec_meta)
+                        if not array_branches:
+                            return result
+                        break
+                    continue
+
+                expr_value = expr_node.evaluator(env, exec_meta)
+                array_branches.append((expr_value, cond_array))
+
+            if result is None:
+                result = np.nan
+            for expr_value, cond_value in reversed(array_branches):
+                result = np.where(cond_value, expr_value, result)
             return result
 
         return _merge_node(eval_piecewise, expr_nodes + cond_nodes)

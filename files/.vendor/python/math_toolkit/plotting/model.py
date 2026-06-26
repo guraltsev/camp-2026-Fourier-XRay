@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import inspect
 from itertools import count
 from pathlib import PurePosixPath
 import math
@@ -87,6 +88,8 @@ from .specs import (
     _parameter_animation_speed,
 )
 
+InteractionCallback = Callable[[], None]
+
 # Default plot colors are model state so toolkit-owned legends and Plotly
 # traces agree without relying on Plotly's implicit colorway.
 _PLOT_COLOR_CYCLE = (
@@ -120,6 +123,12 @@ PLOT_NAMED_COLOR_HEX = MappingProxyType(
     }
 )
 PLOT_NAMED_COLORS = tuple(PLOT_NAMED_COLOR_HEX)
+
+# Animation recomputation must give the host a bounded service window to
+# deliver browser-originated comm callbacks into the figure interaction queue.
+# The queue is the priority boundary; this delay only gives external signals a
+# chance to enter that queue after a synchronous sample has released Python.
+_FRONTEND_INTERACTION_SERVICE_SECONDS = 0.05
 
 
 @dataclass(frozen=True)
@@ -719,7 +728,7 @@ class AnimationScheduler:
         task = self._task
         return task is not None and not task.done()
 
-    def start(self, tick: Callable[[], None]) -> bool:
+    def start(self, tick: Callable[[], object]) -> bool:
         """Start a 60Hz task and return whether it could be scheduled."""
 
         if self.running:
@@ -731,8 +740,11 @@ class AnimationScheduler:
 
         async def _run() -> None:
             while True:
-                tick()
                 await asyncio.sleep(1.0 / 60.0)
+                await asyncio.sleep(0)
+                result = tick()
+                if inspect.isawaitable(result):
+                    await result
 
         self._task = loop.create_task(_run())
         return True
@@ -744,6 +756,46 @@ class AnimationScheduler:
         self._task = None
         if task is not None and not task.done():
             task.cancel()
+
+
+class FigureInteractionQueue:
+    """Store figure-owned UI interactions ahead of animation recomputation."""
+
+    def __init__(self) -> None:
+        """Create an empty interaction queue."""
+
+        self._pending: list[InteractionCallback] = []
+        self._draining = False
+
+    def enqueue(
+        self,
+        callback: InteractionCallback,
+        *,
+        clear_pending: bool = False,
+    ) -> None:
+        """Add one interaction callback, optionally dropping stale queued work."""
+
+        if clear_pending:
+            self._pending.clear()
+        self._pending.append(callback)
+
+    def clear(self) -> None:
+        """Discard queued interaction callbacks."""
+
+        self._pending.clear()
+
+    def drain(self) -> None:
+        """Run queued interactions in FIFO order."""
+
+        if self._draining:
+            return
+        self._draining = True
+        try:
+            while self._pending:
+                callback = self._pending.pop(0)
+                callback()
+        finally:
+            self._draining = False
 
 
 class FigureAnimationCoordinator:
@@ -763,15 +815,28 @@ class FigureAnimationCoordinator:
         self._monotonic = time.monotonic if monotonic is None else monotonic
         self._running: dict[sympy.Basic, RunningParameterAnimation] = {}
         self._animation_write_depth = 0
+        self._animation_write_scopes: list[tuple[sympy.Basic, int, bool]] = []
+        self._stop_revision = 0
 
     @contextmanager
-    def animation_value_write(self) -> Iterator[None]:
+    def animation_value_write(
+        self,
+        symbol: sympy.Basic | None = None,
+        *,
+        stop_revision: int | None = None,
+        allow_stopped: bool = False,
+    ) -> Iterator[None]:
         """Mark parameter value writes that originate from animation ticks."""
 
         self._animation_write_depth += 1
+        if symbol is not None:
+            revision = self._stop_revision if stop_revision is None else stop_revision
+            self._animation_write_scopes.append((symbol, revision, bool(allow_stopped)))
         try:
             yield
         finally:
+            if symbol is not None:
+                self._animation_write_scopes.pop()
             self._animation_write_depth -= 1
 
     @property
@@ -779,6 +844,21 @@ class FigureAnimationCoordinator:
         """Return whether the coordinator is applying its own value write."""
 
         return self._animation_write_depth > 0
+
+    def animation_write_should_continue(
+        self,
+        parameter_symbols: tuple[sympy.Basic, ...],
+    ) -> bool:
+        """Return whether an animation-originated resample is still current."""
+
+        if not self._animation_write_scopes:
+            return True
+        active_symbol, stop_revision, allow_stopped = self._animation_write_scopes[-1]
+        if active_symbol not in parameter_symbols:
+            return True
+        if allow_stopped:
+            return True
+        return active_symbol in self._running and stop_revision == self._stop_revision
 
     @property
     def running_symbols(self) -> frozenset[sympy.Basic]:
@@ -812,7 +892,7 @@ class FigureAnimationCoordinator:
             next_due_time=now,
         )
         if not self._scheduler.running:
-            started = self._scheduler.start(self.tick)
+            started = self._scheduler.start(self.tick_async)
             if not started:
                 self._running.pop(symbol, None)
                 self._figure._queue_output_notice(
@@ -825,6 +905,7 @@ class FigureAnimationCoordinator:
 
         if symbol in self._running:
             del self._running[symbol]
+            self._stop_revision += 1
             self._stop_scheduler_if_idle()
             self._publish_state()
 
@@ -839,6 +920,7 @@ class FigureAnimationCoordinator:
         if not self._running:
             return
         self._running.clear()
+        self._stop_revision += 1
         self._scheduler.stop()
         self._publish_state()
 
@@ -885,6 +967,15 @@ class FigureAnimationCoordinator:
 
         self.tick_at(self._monotonic())
 
+    async def tick_async(self) -> None:
+        """Advance due animations after pending frontend messages run."""
+
+        await self._drain_frontend_events()
+        self._figure.drain_interactions()
+        if not self._running:
+            return
+        await self.tick_at_async(self._monotonic())
+
     def tick_at(self, now: float) -> None:
         """Advance due animations for deterministic tests and scheduler wakes."""
 
@@ -899,6 +990,32 @@ class FigureAnimationCoordinator:
             self._tick_symbol(symbol, state, running, float(now))
         self._stop_scheduler_if_idle()
         self._publish_state()
+
+    async def tick_at_async(self, now: float) -> None:
+        """Advance due animations while yielding before expensive work."""
+
+        for symbol in tuple(self._running):
+            await self._drain_frontend_events()
+            self._figure.drain_interactions()
+            running = self._running.get(symbol)
+            state = self._figure.parameters.get(symbol)
+            if running is None or state is None or not state.animated:
+                self.stop(symbol)
+                continue
+            if now + 1e-12 < running.next_due_time:
+                continue
+            self._tick_symbol(symbol, state, running, float(now))
+        self._stop_scheduler_if_idle()
+        self._publish_state()
+
+    async def _drain_frontend_events(self) -> None:
+        """Yield so browser-originated callbacks can enqueue interactions."""
+
+        self._figure.drain_interactions()
+        await asyncio.sleep(_FRONTEND_INTERACTION_SERVICE_SECONDS)
+        self._figure.drain_interactions()
+        await asyncio.sleep(0)
+        self._figure.drain_interactions()
 
     def _tick_symbol(
         self,
@@ -929,7 +1046,11 @@ class FigureAnimationCoordinator:
         running.direction = direction
         if not keep_running:
             self._running.pop(symbol, None)
-        with self.animation_value_write():
+        with self.animation_value_write(
+            symbol,
+            stop_revision=self._stop_revision,
+            allow_stopped=not keep_running,
+        ):
             state.set_value(value)
 
     def _apply_mode(
@@ -1167,7 +1288,8 @@ class ParameterState:
         """Set the numeric parameter value from a widget or handle call."""
 
         self._figure._animation_coordinator.notify_external_value_write(self.symbol)
-        self.value_signal.set(float(value))
+        with self._figure._coalesced_trace_data_updates(), batch():
+            self.value_signal.set(float(value))
 
     def set_spec(self, spec: ParameterSpec) -> None:
         """Update value and metadata from a normalized spec."""
@@ -2358,7 +2480,12 @@ class PlotNode:
     def _sample_into_buffers(self) -> None:
         """Sample the current signature into reusable buffers."""
 
+        self.figure.drain_interactions()
         signature = self.sample_signature()
+        if not self.figure._animation_coordinator.animation_write_should_continue(
+            signature.parameter_symbols
+        ):
+            return
         compiled = self._compiled_for_signature(signature)
 
         if self.kind == PLOT_KIND_CURVE:
@@ -2538,6 +2665,7 @@ class FigureHandle:
         self._parameters: dict[sympy.Basic, ParameterState] = {}
         self.parameters = FigureParameters(self)
         self.parameter = self.parameters
+        self._interaction_queue = FigureInteractionQueue()
         self._animation_coordinator = FigureAnimationCoordinator(self)
         self.views: list[ViewHandle] = []
         self.views_by_name: dict[str, ViewHandle] = {}
@@ -2563,6 +2691,26 @@ class FigureHandle:
         self._audio_nodes: dict[int, object] = {}
         self._audio_controller = FigureAudioController(self)
         self.sound = FigureSound(self, self._audio_controller)
+
+    def queue_interaction(
+        self,
+        callback: InteractionCallback,
+        *,
+        clear_pending: bool = False,
+    ) -> None:
+        """Queue a UI interaction to run before animation recomputation."""
+
+        self._interaction_queue.enqueue(callback, clear_pending=clear_pending)
+
+    def drain_interactions(self) -> None:
+        """Run queued UI interactions before starting heavier figure work."""
+
+        self._interaction_queue.drain()
+
+    def clear_interactions(self) -> None:
+        """Discard queued UI interactions."""
+
+        self._interaction_queue.clear()
 
     @property
     def name(self) -> str | None:
@@ -2674,6 +2822,18 @@ class FigureHandle:
 
         self._default_backend = normalize_display_backend(backend)
         return self
+
+    def enqueue_interaction(
+        self,
+        callback: InteractionCallback,
+        *,
+        clear_pending: bool = False,
+    ) -> None:
+        """Alias for queueing an external UI interaction."""
+
+        if not callable(callback):
+            raise TypeError("FigureHandle.enqueue_interaction(...) requires a callable.")
+        self.queue_interaction(callback, clear_pending=clear_pending)
 
     @property
     def params(self) -> dict[sympy.Symbol, dict[str, object]]:
@@ -3920,6 +4080,17 @@ class FigureHandle:
                 self._pending_display_update = True
                 return
             self._active_generation.attach_node(node)
+
+    @contextmanager
+    def _coalesced_trace_data_updates(self) -> Iterator[None]:
+        """Coalesce trace data rendering for one model-side mutation."""
+
+        generation = self._active_generation
+        if generation is None:
+            yield
+            return
+        with generation.defer_trace_data_updates():
+            yield
 
     def _default_color_for_plot(self, existing: PlotNode | None) -> str:
         """Return the palette color for a plot's durable figure slot."""

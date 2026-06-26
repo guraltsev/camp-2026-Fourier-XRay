@@ -818,25 +818,26 @@ function render({ model, el }) {
 
   function sync() {
     const label = model.get("label") || "";
+    const title = model.get("title") || "";
     button.className = `mt-button ${model.get("class_name") || ""}`.trim();
     if (label === "gear") {
       button.innerHTML = gearSvg();
-      button.setAttribute("aria-label", model.get("title") || "Edit");
+      button.setAttribute("aria-label", title || "Edit");
     } else if (label === "refresh") {
       button.innerHTML = refreshSvg();
       button.classList.add("mt-button--reset");
-      button.setAttribute("aria-label", model.get("title") || "Reset");
+      button.setAttribute("aria-label", title || "Reset");
     } else if (label === "play") {
       button.innerHTML = playSvg();
-      button.setAttribute("aria-label", model.get("title") || "Animate parameter");
+      button.setAttribute("aria-label", title || "Animate parameter");
     } else if (label === "pause") {
       button.innerHTML = pauseSvg();
-      button.setAttribute("aria-label", model.get("title") || "Pause parameter animation");
+      button.setAttribute("aria-label", title || "Pause parameter animation");
     } else {
       button.textContent = label;
       button.removeAttribute("aria-label");
     }
-    button.title = model.get("title") || "";
+    button.title = title;
     button.disabled = Boolean(model.get("disabled"));
   }
 

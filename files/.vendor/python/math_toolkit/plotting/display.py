@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         ParameterAnimationStateItem,
         PlotNode,
         SliderValueItem,
+        TraceDataSnapshot,
     )
 
 
@@ -385,6 +386,8 @@ class FigureDisplayGeneration:
         self._info_preview_interval = 0.15
         self._node_effects: dict[int, list[object]] = {}
         self._figure_effects: list[object] = []
+        self._trace_data_defer_depth = 0
+        self._pending_trace_data: dict[tuple[int, str], TraceDataSnapshot] = {}
         from .audio import AudioOutputWidget
 
         self.home_sync_widget = self.renderer.home_sync_widget
@@ -462,7 +465,7 @@ class FigureDisplayGeneration:
             snapshots = node.trace_data_signal()
             if snapshots is not None and self.state == "active":
                 for snapshot in snapshots:
-                    self.renderer.render_trace_data(snapshot)
+                    self._render_or_queue_trace_data(snapshot)
 
         def _render_trace_style() -> None:
             if self.state == "active":
@@ -483,9 +486,56 @@ class FigureDisplayGeneration:
         snapshots = node.trace_data_signal()
         if snapshots is not None:
             for snapshot in snapshots:
-                self.renderer.render_trace_data(snapshot)
+                self._render_or_queue_trace_data(snapshot)
         for snapshot in node.trace_style_snapshot():
             self.renderer.render_trace_style(snapshot)
+
+    def defer_trace_data_updates(self) -> object:
+        """Return a context manager that coalesces trace data rendering."""
+
+        generation = self
+
+        class _TraceDataUpdateDeferral:
+            """Queue trace data snapshots until a model mutation finishes."""
+
+            def __enter__(self) -> None:
+                generation._trace_data_defer_depth += 1
+                return None
+
+            def __exit__(
+                self,
+                exc_type: object,
+                exc: object,
+                traceback: object,
+            ) -> None:
+                generation._trace_data_defer_depth = max(
+                    0,
+                    generation._trace_data_defer_depth - 1,
+                )
+                if generation._trace_data_defer_depth == 0:
+                    generation.flush_deferred_trace_data()
+                return None
+
+        return _TraceDataUpdateDeferral()
+
+    def flush_deferred_trace_data(self) -> None:
+        """Render queued trace data snapshots in one Plotly widget batch."""
+
+        if self.state != "active" or self._trace_data_defer_depth:
+            return
+        if not self._pending_trace_data:
+            return
+        snapshots = tuple(self._pending_trace_data.values())
+        self._pending_trace_data.clear()
+        self.renderer.render_trace_data_batch(snapshots)
+
+    def _render_or_queue_trace_data(self, snapshot: TraceDataSnapshot) -> None:
+        """Render one trace snapshot now or queue it for a coalesced flush."""
+
+        if self._trace_data_defer_depth:
+            self._pending_trace_data[(snapshot.node_id, snapshot.trace_role)] = snapshot
+            return
+        self.renderer.render_trace_data(snapshot)
 
     def refresh_from_model(self) -> None:
         """Render the figure's current model state into this generation."""

@@ -389,64 +389,67 @@ class AnywidgetParameterControls:
         def _on_value(_change: dict[str, object], *, control_key=key) -> None:
             if self._syncing_widget_values:
                 return
-            state = self._state_for_key(control_key)
             number = self._finite_float(widget.slider.browser_value)
             if number is not None:
                 self._sync_value_entry(widget, number)
-            if state is not None and number is not None:
-                self._apply_browser_value(state, number)
+                self._queue_interaction(
+                    lambda number=number, control_key=control_key: (
+                        self._apply_browser_value_for_key(control_key, number)
+                    )
+                )
 
         def _on_release(_change: dict[str, object], *, control_key=key) -> None:
             if self._syncing_widget_values:
                 return
-            self._settle_widget_value(control_key)
+            self._queue_interaction(
+                lambda control_key=control_key: self._settle_widget_value(control_key)
+            )
 
         def _on_value_commit(_change: dict[str, object], *, control_key=key) -> None:
             if self._syncing_widget_values:
                 return
-            self._commit_value_text(control_key, widget.value_entry.value)
+            value = widget.value_entry.value
+            self._queue_interaction(
+                lambda control_key=control_key, value=value: (
+                    self._commit_value_text(control_key, value)
+                )
+            )
 
         def _on_minimum_commit(_change: dict[str, object], *, control_key=key) -> None:
             if self._syncing_widget_values:
                 return
-            self._commit_limit_text(control_key, "minimum", widget.minimum_entry.value)
+            value = widget.minimum_entry.value
+            self._queue_interaction(
+                lambda control_key=control_key, value=value: (
+                    self._commit_limit_text(control_key, "minimum", value)
+                )
+            )
 
         def _on_maximum_commit(_change: dict[str, object], *, control_key=key) -> None:
             if self._syncing_widget_values:
                 return
-            self._commit_limit_text(control_key, "maximum", widget.maximum_entry.value)
+            value = widget.maximum_entry.value
+            self._queue_interaction(
+                lambda control_key=control_key, value=value: (
+                    self._commit_limit_text(control_key, "maximum", value)
+                )
+            )
 
         def _on_edit(_change: dict[str, object], *, control_key=key) -> None:
-            if not self.generation.accepts_frontend_events():
-                return
-            item = self.layout_items.get(control_key)
-            if item is not None:
-                self.generation.frontend.modal.open_parameter(
-                    node_id=item.node_id,
-                    symbol_text=str(item.symbol),
-                )
+            self._queue_interaction(
+                lambda control_key=control_key: self._open_parameter_settings(control_key)
+            )
 
         def _on_reset(_change: dict[str, object], *, control_key=key) -> None:
-            if not self.generation.accepts_frontend_events():
-                return
-            symbol = self._symbol_for_text(control_key[1])
-            if symbol is None:
-                return
-            default_value = self.generation.figure._default_parameter_value(symbol)
-            if default_value is None:
-                return
-            state = self.generation.figure.parameters.get(symbol)
-            if state is not None:
-                state.set_value(default_value)
+            self._queue_interaction(
+                lambda control_key=control_key: self._reset_parameter(control_key),
+                clear_pending=True,
+            )
 
         def _on_animation(_change: dict[str, object], *, control_key=key) -> None:
-            if not self.generation.accepts_frontend_events():
-                return
-            symbol = self._symbol_for_text(control_key[1])
-            if symbol is not None:
-                state = self.generation.figure.parameters.get(symbol)
-                if state is not None:
-                    state.animate.toggle()
+            self._queue_interaction(
+                lambda control_key=control_key: self._toggle_animation(control_key)
+            )
 
         def _on_value_commit_message(
             _widget: object,
@@ -456,9 +459,12 @@ class AnywidgetParameterControls:
             control_key=key,
         ) -> None:
             if content.get("type") == messages.COMMIT_PARAMETER_VALUE:
-                if not self.generation.accepts_frontend_events():
-                    return
-                self._commit_value_text(control_key, content.get("value"))
+                value = content.get("value")
+                self._queue_interaction(
+                    lambda control_key=control_key, value=value: (
+                        self._commit_value_text(control_key, value)
+                    )
+                )
 
         def _on_minimum_commit_message(
             _widget: object,
@@ -468,9 +474,12 @@ class AnywidgetParameterControls:
             control_key=key,
         ) -> None:
             if content.get("type") == messages.COMMIT_PARAMETER_MINIMUM:
-                if not self.generation.accepts_frontend_events():
-                    return
-                self._commit_limit_text(control_key, "minimum", content.get("value"))
+                value = content.get("value")
+                self._queue_interaction(
+                    lambda control_key=control_key, value=value: (
+                        self._commit_limit_text(control_key, "minimum", value)
+                    )
+                )
 
         def _on_maximum_commit_message(
             _widget: object,
@@ -480,9 +489,12 @@ class AnywidgetParameterControls:
             control_key=key,
         ) -> None:
             if content.get("type") == messages.COMMIT_PARAMETER_MAXIMUM:
-                if not self.generation.accepts_frontend_events():
-                    return
-                self._commit_limit_text(control_key, "maximum", content.get("value"))
+                value = content.get("value")
+                self._queue_interaction(
+                    lambda control_key=control_key, value=value: (
+                        self._commit_limit_text(control_key, "maximum", value)
+                    )
+                )
 
         def _on_reset_message(
             _widget: object,
@@ -492,7 +504,10 @@ class AnywidgetParameterControls:
             control_key=key,
         ) -> None:
             if content.get("type") == messages.RESET_PARAMETER:
-                _on_reset({}, control_key=control_key)
+                self._queue_interaction(
+                    lambda control_key=control_key: self._reset_parameter(control_key),
+                    clear_pending=True,
+                )
 
         def _on_edit_message(
             _widget: object,
@@ -502,7 +517,11 @@ class AnywidgetParameterControls:
             control_key=key,
         ) -> None:
             if content.get("type") == messages.OPEN_PARAMETER_SETTINGS:
-                _on_edit({}, control_key=control_key)
+                self._queue_interaction(
+                    lambda control_key=control_key: (
+                        self._open_parameter_settings(control_key)
+                    )
+                )
 
         def _on_animation_message(
             _widget: object,
@@ -513,21 +532,13 @@ class AnywidgetParameterControls:
         ) -> None:
             if content.get("type") != messages.PARAMETER_ANIMATION_BUTTON:
                 return
-            if not self.generation.accepts_frontend_events():
-                return
-            symbol = self._symbol_for_text(control_key[1])
-            if symbol is None:
-                return
-            state = self.generation.figure.parameters.get(symbol)
-            if state is None:
-                return
             action = content.get("action")
-            if action == "pause":
-                state.animate.stop()
-            elif action == "play":
-                state.animate.start()
-            else:
-                state.animate.toggle()
+            self._queue_interaction(
+                lambda control_key=control_key, action=action: (
+                    self._apply_animation_action(control_key, action)
+                ),
+                clear_pending=action == "pause",
+            )
 
         observers = (
             (widget.slider, "browser_value", _on_value),
@@ -615,6 +626,29 @@ class AnywidgetParameterControls:
         finally:
             self._syncing_widget_values = previous
 
+    def _queue_interaction(
+        self,
+        action: Callable[[], None],
+        *,
+        clear_pending: bool = False,
+    ) -> None:
+        """Queue and service one figure-owned UI interaction."""
+
+        figure = self.generation.figure
+        figure.enqueue_interaction(action, clear_pending=clear_pending)
+        figure.drain_interactions()
+
+    def _apply_browser_value_for_key(
+        self,
+        key: tuple[int, str],
+        number: float,
+    ) -> None:
+        """Apply one browser-originated slider value for a control key."""
+
+        state = self._state_for_key(key)
+        if state is not None:
+            self._apply_browser_value(state, number)
+
     def _apply_browser_value(self, state: object, number: float) -> None:
         """Apply one browser-originated value while suppressing mirror echoes."""
 
@@ -631,6 +665,60 @@ class AnywidgetParameterControls:
                 state.set_value(number)
         finally:
             self._browser_value_event_depth -= 1
+
+    def _open_parameter_settings(self, key: tuple[int, str]) -> None:
+        """Open parameter settings from a queued UI interaction."""
+
+        if not self.generation.accepts_frontend_events():
+            return
+        item = self.layout_items.get(key)
+        if item is not None:
+            self.generation.frontend.modal.open_parameter(
+                node_id=item.node_id,
+                symbol_text=str(item.symbol),
+            )
+
+    def _reset_parameter(self, key: tuple[int, str]) -> None:
+        """Reset one parameter from a queued UI interaction."""
+
+        if not self.generation.accepts_frontend_events():
+            return
+        symbol = self._symbol_for_text(key[1])
+        if symbol is None:
+            return
+        default_value = self.generation.figure._default_parameter_value(symbol)
+        if default_value is None:
+            return
+        state = self.generation.figure.parameters.get(symbol)
+        if state is not None:
+            state.set_value(default_value)
+
+    def _toggle_animation(self, key: tuple[int, str]) -> None:
+        """Toggle parameter animation from a queued UI interaction."""
+
+        self._apply_animation_action(key, "toggle")
+
+    def _apply_animation_action(
+        self,
+        key: tuple[int, str],
+        action: object,
+    ) -> None:
+        """Apply a play, pause, or toggle intent from the interaction queue."""
+
+        if not self.generation.accepts_frontend_events():
+            return
+        symbol = self._symbol_for_text(key[1])
+        if symbol is None:
+            return
+        state = self.generation.figure.parameters.get(symbol)
+        if state is None:
+            return
+        if action == "pause":
+            state.animate.stop()
+        elif action == "play":
+            state.animate.start()
+        else:
+            state.animate.toggle()
 
     def _settle_widget_value(self, key: tuple[int, str]) -> None:
         """Publish the authoritative model value after a browser release."""

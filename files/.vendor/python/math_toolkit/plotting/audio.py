@@ -306,6 +306,7 @@ class FigureAudioController:
         if active is not None:
             active.pause()
         session_id = self.active_output_session_signal()
+        self.active_output_session_signal.set(None)
         if session_id is not None:
             self.figure._send_audio_output_command(
                 {"type": "pause", "session_id": session_id}
@@ -2402,10 +2403,14 @@ registerProcessor("math-toolkit-audio-stream", MathToolkitAudioStreamProcessor);
     } else if (message.type === "chunk" || message.type === "batch") {
       scheduleAudioData(message, buffers || []);
     } else if (message.type === "pause") {
-      if (context !== null) {
-        context.suspend();
+      if (message.session_id === sessionId) {
+        disposeSession();
       }
-    } else if (message.type === "stop" || message.type === "stale") {
+    } else if (message.type === "stale") {
+      if (message.session_id === sessionId) {
+        disposeSession();
+      }
+    } else if (message.type === "stop") {
       disposeSession();
     } else if (message.type === "debug") {
       debugEnabled = Boolean(message.enabled);

@@ -74,21 +74,39 @@ class PlotlyRenderer:
     def render_trace_data(self, snapshot: TraceDataSnapshot) -> None:
         """Create or update one Plotly trace's sampled data."""
 
+        with self.figure_widget.batch_update():
+            created = self._render_trace_data_in_batch(snapshot)
+        if created:
+            self._sync_full_widget_data()
+
+    def render_trace_data_batch(self, snapshots: tuple[TraceDataSnapshot, ...]) -> None:
+        """Create or update several Plotly traces in one widget batch."""
+
+        if not snapshots:
+            return
+        created_any = False
+        with self.figure_widget.batch_update():
+            for snapshot in snapshots:
+                created_any = self._render_trace_data_in_batch(snapshot) or created_any
+        if created_any:
+            self._sync_full_widget_data()
+
+    def _render_trace_data_in_batch(self, snapshot: TraceDataSnapshot) -> bool:
+        """Apply one trace data snapshot inside an existing Plotly batch."""
+
         trace, created = self._trace_for_snapshot(snapshot)
 
         # Plotly copies the active views into the widget model. The Python-side
         # buffers remain owned by the node and can be reused on the next sample.
-        with self.figure_widget.batch_update():
-            trace.x = _json_safe_plotly_data(snapshot.x)
-            trace.y = _json_safe_plotly_data(snapshot.y)
-            if snapshot.z is not None:
-                trace.z = _json_safe_plotly_data(snapshot.z)
-            if snapshot.contour_level is not None:
-                trace.contours.start = snapshot.contour_level
-                trace.contours.end = snapshot.contour_level
-                trace.contours.size = 1
-        if created:
-            self._sync_full_widget_data()
+        trace.x = _json_safe_plotly_data(snapshot.x)
+        trace.y = _json_safe_plotly_data(snapshot.y)
+        if snapshot.z is not None:
+            trace.z = _json_safe_plotly_data(snapshot.z)
+        if snapshot.contour_level is not None:
+            trace.contours.start = snapshot.contour_level
+            trace.contours.end = snapshot.contour_level
+            trace.contours.size = 1
+        return created
 
     def render_trace_style(self, snapshot: TraceStyleSnapshot) -> None:
         """Update one Plotly trace's display style without touching sampled data."""
